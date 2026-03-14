@@ -90,6 +90,7 @@ BUILTIN_DEFAULTS: dict[str, Any] = {
     "failing": False,
     "stale": False,
     "inbox": False,
+    "commands": False,
     "digest": None,
     "standup": False,
     "repo": None,
@@ -417,6 +418,64 @@ class RecentWins:
 
 
 @dataclass
+class HistoryEntry:
+    generated_at: datetime
+    review_queue_count: int
+    assigned_issue_count: int
+    failing_pr_count: int
+    active_repo_count: int
+    review_pr_ids: set[str]
+    issue_ids: set[str]
+    ready_pr_ids: set[str]
+    repo_pushes: dict[str, str]
+    pr_check_states: dict[str, str]
+
+
+@dataclass
+class TimelineMetric:
+    label: str
+    values: list[int]
+    current: int
+    previous: int
+    delta: int
+
+
+@dataclass
+class MomentumTimeline:
+    metrics: list[TimelineMetric]
+    narrative: str
+    sample_count: int
+    span_days: int
+    fallback: str | None = None
+
+
+@dataclass
+class CommandSuggestion:
+    label: str
+    command: str
+    reason: str
+    priority: int
+
+
+@dataclass
+class ChangeEvent:
+    badge: str
+    summary: str
+    sign: str
+    priority: int
+    command: str | None = None
+
+
+@dataclass
+class DailyPlanItem:
+    summary: str
+    urgency: str
+    reason: str
+    command: str | None
+    priority: int
+
+
+@dataclass
 class DashboardData:
     generated_at: datetime
     viewer_login: str
@@ -433,7 +492,12 @@ class DashboardData:
     repo_health_matrix: list[RepoHealth]
     repo_health: RepoHealth | None
     recent_wins: RecentWins
+    momentum_timeline: MomentumTimeline
     digest: DigestMetrics | None
+    daily_plan: list[DailyPlanItem]
+    command_suggestions: list[CommandSuggestion]
+    command_catalog: list[CommandSuggestion]
+    change_feed: list[ChangeEvent]
     contribution_weeks: list[list[dict[str, Any]]]
     contribution_days: list[dict[str, Any]]
     current_streak: int
@@ -621,6 +685,12 @@ def build_parser(defaults: dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--stale", action="store_true", default=bool(defaults["stale"]), help="Focus on work stale for 3+ days.")
     parser.add_argument("--inbox", action="store_true", default=bool(defaults["inbox"]), help="Focus on unread mentions, assignments, and review requests.")
     parser.add_argument(
+        "--commands",
+        action="store_true",
+        default=bool(defaults["commands"]),
+        help="Show a larger actionable command section.",
+    )
+    parser.add_argument(
         "--digest",
         choices=["daily", "weekly"],
         default=defaults["digest"],
@@ -698,7 +768,7 @@ def validate_config_values(values: dict[str, Any], label: str) -> None:
         elif key in {"org", "export_md", "export_html", "export_update"}:
             if value is not None and not isinstance(value, str):
                 raise GhError(f"{label} field `{key}` must be a string or null.")
-        elif key in {"refresh", "no_cache", "watch", "reviews", "failing", "stale", "inbox", "standup"}:
+        elif key in {"refresh", "no_cache", "watch", "reviews", "failing", "stale", "inbox", "commands", "standup"}:
             if not isinstance(value, bool):
                 raise GhError(f"{label} field `{key}` must be true or false.")
 
@@ -826,6 +896,8 @@ def build_dashboard(
         repos, review_prs, authored_prs, assigned_issues, notifications, args, generated_at
     )
 
+    history = read_history()
+    history_entries = read_history_entries(generated_at)
     recent_wins = fetch_recent_wins(viewer_login, generated_at, RECENT_WINS_LIMIT)
     attention_items = build_attention_items(
         review_prs, authored_prs, assigned_issues, notifications, generated_at, args.limit
@@ -885,18 +957,61 @@ def build_dashboard(
     focus_label = build_focus_label(args)
     subtitle = build_subtitle(args)
     daily_brief = build_daily_brief(summary, repos, attention_items, recent_wins, focus_label)
+    current_history = make_history_entry_from_snapshot(
+        {
+            "generated_at": iso_datetime(generated_at),
+            "reviews_waiting": summary["reviews_waiting"],
+            "assigned_issues": summary["assigned_issues"],
+            "failing_prs": summary["failing_prs"],
+            "active_repos": summary["active_repos"],
+            "review_pr_ids": [pr.key for pr in review_prs],
+            "issue_ids": [issue.key for issue in assigned_issues],
+            "ready_pr_ids": [pr.key for pr in ready_prs],
+            "repo_pushes": {repo.name: iso_datetime(repo.pushed_at) for repo in repos if repo.pushed_at},
+            "pr_check_states": {pr.key: pr.check_state for pr in authored_prs},
+        }
+    )
+    if current_history:
+        history_entries = [*history_entries, current_history]
     changes = build_changes(
         previous_snapshot,
         repos,
         review_prs,
         authored_prs,
         assigned_issues,
-        notifications,
         current_streak,
         generated_at,
     )
-    history = read_history()
+    change_feed = build_change_feed(
+        previous_snapshot,
+        repos,
+        review_prs,
+        authored_prs,
+        assigned_issues,
+        generated_at,
+        limit=max(4, min(args.limit + 2, 8)),
+    )
+    momentum_timeline = build_momentum_timeline(history_entries)
     digest = build_digest(args, history, generated_at, viewer_login, current_streak)
+    command_suggestions, command_catalog = build_command_suggestions(
+        args,
+        attention_items,
+        review_prs,
+        authored_prs,
+        failing_prs,
+        assigned_issues,
+        inbox_items,
+        repo_health,
+        repos,
+    )
+    daily_plan = build_daily_plan(
+        attention_items,
+        inbox_items,
+        repo_health_matrix,
+        failing_prs,
+        assigned_issues,
+        limit=min(max(3, args.limit), 5),
+    )
     share_update = build_share_update(
         summary=summary,
         attention_items=attention_items,
@@ -905,6 +1020,9 @@ def build_dashboard(
         recent_wins=recent_wins,
         repo_health=repo_health,
         focus_label=focus_label,
+        daily_plan=daily_plan,
+        command_suggestions=command_suggestions,
+        momentum_timeline=momentum_timeline,
     )
 
     return DashboardData(
@@ -923,7 +1041,12 @@ def build_dashboard(
         repo_health_matrix=repo_health_matrix,
         repo_health=repo_health,
         recent_wins=recent_wins,
+        momentum_timeline=momentum_timeline,
         digest=digest,
+        daily_plan=daily_plan,
+        command_suggestions=command_suggestions,
+        command_catalog=command_catalog,
+        change_feed=change_feed,
         contribution_weeks=contribution_weeks,
         contribution_days=contribution_days,
         current_streak=current_streak,
@@ -1166,8 +1289,8 @@ def resolve_notification_target(
         return candidate, command_for_subject_url(repository, subject_type, candidate)
 
     patterns = [
-        (r"/repos/([^/]+/[^/]+)/pulls/(\d+)$", lambda repo, num: (f"https://github.com/{repo}/pull/{num}", f"gh pr view {repo}#{num} --web")),
-        (r"/repos/([^/]+/[^/]+)/issues/(\d+)$", lambda repo, num: (f"https://github.com/{repo}/issues/{num}", f"gh issue view {repo}#{num} --web")),
+        (r"/repos/([^/]+/[^/]+)/pulls/(\d+)$", lambda repo, num: (f"https://github.com/{repo}/pull/{num}", f"gh pr view {num} -R {repo} --web")),
+        (r"/repos/([^/]+/[^/]+)/issues/(\d+)$", lambda repo, num: (f"https://github.com/{repo}/issues/{num}", f"gh issue view {num} -R {repo} --comments")),
         (
             r"/repos/([^/]+/[^/]+)/pulls/comments/(\d+)$",
             lambda repo, num: (f"https://github.com/{repo}/pulls", f"gh repo view {repo} --web"),
@@ -1191,9 +1314,9 @@ def resolve_notification_target(
 def command_for_subject_url(repository: str, subject_type: str, url: str) -> str:
     lowered = subject_type.lower()
     if "pull" in lowered:
-        return f"gh pr view --repo {repository} --web"
+        return f"gh pr list -R {repository} --limit 10"
     if "issue" in lowered:
-        return f"gh issue view --repo {repository} --web"
+        return f"gh issue list -R {repository} --limit 10"
     if "release" in lowered:
         return f"gh release list --repo {repository} --limit 1"
     return f"gh repo view {repository} --web"
@@ -1420,11 +1543,11 @@ def build_repo_health_next_steps(
     if workflow_runs and any((run.get("conclusion") or "").lower() == "failure" for run in workflow_runs):
         steps.append(f"gh run list --repo {repository} --limit {REPO_WORKFLOW_LIMIT}")
     if merge_ready_prs:
-        steps.append(f"gh pr view {merge_ready_prs[0].key} --web")
+        steps.append(pr_web_command(merge_ready_prs[0]))
     if oldest_open_pr:
-        steps.append(f"gh pr view {oldest_open_pr.key} --web")
+        steps.append(pr_web_command(oldest_open_pr))
     if oldest_open_issue:
-        steps.append(f"gh issue view {oldest_open_issue.key} --web")
+        steps.append(issue_comments_command(oldest_open_issue))
     if not steps:
         steps.append(f"gh repo view {repository} --web")
     return unique_preserving_order(steps)[:4]
@@ -1556,6 +1679,9 @@ def build_share_update(
     recent_wins: RecentWins,
     repo_health: RepoHealth | None,
     focus_label: str,
+    daily_plan: list[DailyPlanItem],
+    command_suggestions: list[CommandSuggestion],
+    momentum_timeline: MomentumTimeline,
 ) -> str:
     wins = [recent_wins.narrative]
     if digest:
@@ -1566,7 +1692,9 @@ def build_share_update(
     asks = [item for item in notifications if item.reason in {"review_requested", "mention", "assign"}][:2]
     next_items = attention_items[:2]
     if repo_health and repo_health.merge_ready_prs:
-        next_items = [action_for_authored_pr(repo_health.merge_ready_prs[0], datetime.now(timezone.utc)) or next_items[0]]
+        merge_item = action_for_authored_pr(repo_health.merge_ready_prs[0], datetime.now(timezone.utc))
+        if merge_item:
+            next_items = [merge_item, *next_items][:2]
 
     lines = [f"Focus: {focus_label}"]
     lines.append("Wins:")
@@ -1586,6 +1714,16 @@ def build_share_update(
     lines.append("Next:")
     for item in next_items:
         lines.append(f"- {item.repository}: {item.next_step}")
+    if daily_plan:
+        lines.append("Plan:")
+        for item in daily_plan[:3]:
+            lines.append(f"- [{item.urgency}] {item.summary}")
+    lines.append("Momentum:")
+    lines.append(f"- {momentum_timeline.narrative}")
+    if command_suggestions:
+        lines.append("Commands:")
+        for item in command_suggestions[:3]:
+            lines.append(f"- `{item.command}`")
     return "\n".join(lines)
 
 
@@ -1711,7 +1849,7 @@ def action_for_review_pr(pr: PullRequest, now: datetime) -> ActionItem:
     badges = ["REVIEW"]
     bucket = "DO NOW"
     reason = f"review requested {relative_time_long(pr.updated_at, now)} ago"
-    next_step = f"gh pr view {pr.key} --web"
+    next_step = pr_web_command(pr)
     score = 120 + stale_score(pr.updated_at, now)
     if is_stale(pr.updated_at, now):
         badges.append("STALE")
@@ -1742,13 +1880,13 @@ def action_for_authored_pr(pr: PullRequest, now: datetime) -> ActionItem | None:
     badges: list[str] = []
     bucket = "WAITING"
     reason = f"updated {relative_time_long(pr.updated_at, now)} ago"
-    next_step = f"gh pr view {pr.key} --web"
+    next_step = pr_web_command(pr)
     score = 30 + recent_boost(pr.updated_at, now)
 
     if pr.check_state in {"FAILURE", "ERROR"}:
         badges.append("FAILING")
         reason = "checks failing"
-        next_step = f"gh pr checkout {pr.number}"
+        next_step = pr_checkout_command(pr)
         if is_older_than(pr.updated_at, now, hours=FAILING_RISK_HOURS):
             bucket = "AT RISK"
             reason = f"checks failing for {relative_time_long(pr.updated_at, now)}"
@@ -1765,7 +1903,7 @@ def action_for_authored_pr(pr: PullRequest, now: datetime) -> ActionItem | None:
         badges.append("BEHIND")
         bucket = "AT RISK"
         reason = "behind base branch"
-        next_step = f"gh pr checkout {pr.number}"
+        next_step = pr_checkout_command(pr)
         score = 88
     elif is_stale(pr.updated_at, now):
         badges.append("STALE")
@@ -1816,7 +1954,7 @@ def action_for_issue(issue: Issue, now: datetime) -> ActionItem:
         score=score,
         check_state="",
         reason=reason,
-        next_step=f"gh issue view {issue.key} --web",
+        next_step=issue_comments_command(issue),
         age_bucket=age_bucket(issue.updated_at, now),
         bucket=bucket,
     )
@@ -2064,6 +2202,10 @@ def snapshot_from_dashboard(data: DashboardData) -> dict[str, Any]:
         "schema_version": CACHE_VERSION,
         "generated_at": iso_datetime(data.generated_at),
         "viewer_login": data.viewer_login,
+        "reviews_waiting": data.summary["reviews_waiting"],
+        "assigned_issues": data.summary["assigned_issues"],
+        "failing_prs": data.summary["failing_prs"],
+        "active_repos": data.summary["active_repos"],
         "review_pr_ids": [pr.key for pr in data.review_prs],
         "issue_ids": [issue.key for issue in data.assigned_issues],
         "repo_pushes": {repo.name: iso_datetime(repo.pushed_at) for repo in data.repos if repo.pushed_at is not None},
@@ -2131,6 +2273,352 @@ def history_streak_at_or_before(history: list[dict[str, Any]], target: datetime)
     return None
 
 
+def read_history_entries(now: datetime, max_days: int = 14) -> list[HistoryEntry]:
+    raw_history = read_history()
+    cutoff = now - timedelta(days=max_days)
+    parsed: list[HistoryEntry] = []
+    for row in raw_history:
+        entry = parse_history_entry(row)
+        if entry is None or entry.generated_at < cutoff:
+            continue
+        parsed.append(entry)
+    parsed.sort(key=lambda item: item.generated_at)
+    return parsed
+
+
+def parse_history_entry(row: dict[str, Any]) -> HistoryEntry | None:
+    generated_at = normalize_history_timestamp(row.get("generated_at"))
+    if generated_at is None:
+        return None
+    return HistoryEntry(
+        generated_at=generated_at,
+        review_queue_count=safe_int(row.get("reviews_waiting"), fallback=len(row.get("review_pr_ids") or [])),
+        assigned_issue_count=safe_int(row.get("assigned_issues"), fallback=len(row.get("issue_ids") or [])),
+        failing_pr_count=safe_int(row.get("failing_prs"), fallback=count_failing_states(row.get("pr_check_states"))),
+        active_repo_count=safe_int(row.get("active_repos"), fallback=safe_int(row.get("active_repos_touched"))),
+        review_pr_ids={item for item in (row.get("review_pr_ids") or []) if isinstance(item, str) and item},
+        issue_ids={item for item in (row.get("issue_ids") or []) if isinstance(item, str) and item},
+        ready_pr_ids={item for item in (row.get("ready_pr_ids") or []) if isinstance(item, str) and item},
+        repo_pushes={
+            name: stamp
+            for name, stamp in (row.get("repo_pushes") or {}).items()
+            if isinstance(name, str) and isinstance(stamp, str)
+        },
+        pr_check_states={
+            name: normalize_check_state(state)
+            for name, state in (row.get("pr_check_states") or {}).items()
+            if isinstance(name, str)
+        },
+    )
+
+
+def make_history_entry_from_snapshot(snapshot: dict[str, Any]) -> HistoryEntry | None:
+    return parse_history_entry(snapshot)
+
+
+def normalize_history_timestamp(value: Any) -> datetime | None:
+    if isinstance(value, (int, float)):
+        with contextlib.suppress(OverflowError, OSError, ValueError):
+            return datetime.fromtimestamp(value, tz=timezone.utc)
+    if isinstance(value, str):
+        return parse_dt(value)
+    return None
+
+
+def safe_int(value: Any, fallback: int = 0) -> int:
+    if isinstance(value, bool):
+        return fallback
+    with contextlib.suppress(TypeError, ValueError):
+        return int(value)
+    return fallback
+
+
+def count_failing_states(pr_check_states: Any) -> int:
+    if not isinstance(pr_check_states, dict):
+        return 0
+    return sum(1 for state in pr_check_states.values() if normalize_check_state(state) in {"FAILURE", "ERROR"})
+
+
+def normalize_check_state(state: Any) -> str:
+    if not isinstance(state, str):
+        return "UNKNOWN"
+    normalized = state.strip().upper()
+    return normalized or "UNKNOWN"
+
+
+def build_momentum_timeline(history_entries: list[HistoryEntry]) -> MomentumTimeline:
+    if len(history_entries) < 3:
+        return MomentumTimeline(
+            metrics=[],
+            narrative="Momentum needs a few more saved snapshots before a trendline is honest.",
+            sample_count=len(history_entries),
+            span_days=0,
+            fallback="Need at least 3 valid snapshots from the last 7-14 days.",
+        )
+
+    metrics = [
+        timeline_metric("Review queue", [entry.review_queue_count for entry in history_entries]),
+        timeline_metric("Assigned issues", [entry.assigned_issue_count for entry in history_entries]),
+        timeline_metric("Failing PRs", [entry.failing_pr_count for entry in history_entries]),
+        timeline_metric("Active repos", [entry.active_repo_count for entry in history_entries]),
+    ]
+    burden_delta = sum(metric.delta for metric in metrics[:3]) - metrics[3].delta
+    if burden_delta <= -2:
+        narrative = "Workload is improving: queues are easing relative to repo activity."
+    elif burden_delta >= 2:
+        narrative = "Workload is worsening: incoming work is outpacing the current burn-down."
+    else:
+        narrative = "Workload is mostly stable across the recent snapshot window."
+    span_days = max((history_entries[-1].generated_at - history_entries[0].generated_at).days, 0)
+    return MomentumTimeline(
+        metrics=metrics,
+        narrative=narrative,
+        sample_count=len(history_entries),
+        span_days=span_days,
+        fallback=None,
+    )
+
+
+def timeline_metric(label: str, values: list[int]) -> TimelineMetric:
+    current = values[-1] if values else 0
+    midpoint = max(len(values) // 2, 1)
+    previous_slice = values[:midpoint]
+    previous = round(sum(previous_slice) / len(previous_slice)) if previous_slice else current
+    return TimelineMetric(
+        label=label,
+        values=values,
+        current=current,
+        previous=previous,
+        delta=current - previous,
+    )
+
+
+def build_change_feed(
+    previous_snapshot: dict[str, Any] | None,
+    repos: list[Repo],
+    review_prs: list[PullRequest],
+    authored_prs: list[PullRequest],
+    assigned_issues: list[Issue],
+    now: datetime,
+    limit: int,
+) -> list[ChangeEvent]:
+    if previous_snapshot is None:
+        return [ChangeEvent("FIRST RUN", "First watch refresh: collecting a baseline snapshot.", "~", 999, None)]
+
+    previous = parse_history_entry(previous_snapshot)
+    if previous is None:
+        return [ChangeEvent("FIRST RUN", "Baseline snapshot is not readable yet; next refresh will show deltas.", "~", 999, None)]
+
+    events: list[ChangeEvent] = []
+    review_lookup = {pr.key: pr for pr in review_prs}
+    issue_lookup = {issue.key: issue for issue in assigned_issues}
+    repo_pushes = {repo.name: repo.pushed_at for repo in repos if repo.pushed_at}
+    authored_lookup = {pr.key: pr for pr in authored_prs}
+
+    for key in sorted(set(review_lookup) - previous.review_pr_ids):
+        pr = review_lookup[key]
+        events.append(ChangeEvent("REVIEW", f"New review request on {key}", "+", 10, pr_web_command(pr)))
+    for key in sorted(set(issue_lookup) - previous.issue_ids):
+        issue = issue_lookup[key]
+        events.append(ChangeEvent("ISSUE", f"New assigned issue {key}", "+", 20, issue_comments_command(issue)))
+    for key, pr in authored_lookup.items():
+        old_state = previous.pr_check_states.get(key)
+        new_state = normalize_check_state(pr.check_state)
+        if old_state in {"SUCCESS", "PENDING", "EXPECTED", "UNKNOWN"} and new_state in {"FAILURE", "ERROR"}:
+            events.append(ChangeEvent("CHECKS", f"{key} checks flipped to failing", "-", 15, pr_checks_command(pr)))
+        elif old_state in {"FAILURE", "ERROR"} and new_state == "SUCCESS":
+            events.append(ChangeEvent("CHECKS", f"{key} checks recovered", "+", 35, pr_web_command(pr)))
+    for repo_name, pushed_at in repo_pushes.items():
+        previous_stamp = previous.repo_pushes.get(repo_name)
+        if pushed_at and previous_stamp != iso_datetime(pushed_at):
+            events.append(ChangeEvent("PUSH", f"Fresh push detected in {repo_name}", "+", 40, repo_view_command(repo_name)))
+    resolved_reviews = sorted(previous.review_pr_ids - set(review_lookup))
+    for key in resolved_reviews[:2]:
+        events.append(ChangeEvent("RESOLVED", f"Review request cleared for {key}", "+", 55, pr_key_view_command(key)))
+    resolved_issues = sorted(previous.issue_ids - set(issue_lookup))
+    for key in resolved_issues[:2]:
+        events.append(ChangeEvent("RESOLVED", f"Assigned issue cleared for {key}", "+", 60, issue_key_view_command(key)))
+    if not events:
+        events.append(ChangeEvent("STABLE", f"No material changes since {format_timestamp(previous.generated_at or now)}.", "~", 999, None))
+    events.sort(key=lambda event: (event.priority, event.summary))
+    return events[:limit]
+
+
+def build_command_suggestions(
+    args: argparse.Namespace,
+    attention_items: list[ActionItem],
+    review_prs: list[PullRequest],
+    authored_prs: list[PullRequest],
+    failing_prs: list[PullRequest],
+    assigned_issues: list[Issue],
+    inbox_items: list[NotificationItem],
+    repo_health: RepoHealth | None,
+    repos: list[Repo],
+) -> tuple[list[CommandSuggestion], list[CommandSuggestion]]:
+    suggestions: list[CommandSuggestion] = []
+    seen: set[str] = set()
+
+    def add(label: str, command: str, reason: str, priority: int) -> None:
+        if not command or command in seen:
+            return
+        suggestions.append(CommandSuggestion(label=label, command=command, reason=reason, priority=priority))
+        seen.add(command)
+
+    for pr in review_prs[:2]:
+        add(f"Review {pr.key}", pr_web_command(pr), "review-requested PR", 10)
+        add(f"Checkout {pr.key}", pr_checkout_command(pr), "pull branch locally", 20)
+    for pr in failing_prs[:2]:
+        add(f"Fix {pr.key}", pr_checkout_command(pr), "authored PR has failing checks", 12)
+        add(f"Check CI {pr.key}", pr_checks_command(pr), "inspect failing checks", 13)
+    for pr in authored_prs:
+        if is_ready_pr(pr):
+            add(f"Merge-ready {pr.key}", pr_web_command(pr), "approved and mergeable", 25)
+            break
+    for issue in assigned_issues[:2]:
+        add(f"Issue {issue.key}", issue_comments_command(issue), "assigned issue needs context", 30)
+    for note in inbox_items[:2]:
+        add(f"Inbox {note.repository}", note.next_step, f"{note.reason_label.lower()} notification", 35)
+    if repo_health:
+        add(f"Repo {repo_health.repository}", repo_view_command(repo_health.repository), "open repo drilldown in browser", 45)
+        if repo_health.next_steps:
+            add("Repo next step", repo_health.next_steps[0], "follow repo health recommendation", 46)
+    for repo in repos[:1]:
+        add(f"Inspect {repo.name}", repo_view_command(repo.name), "active repo drilldown", 50)
+
+    suggestions.sort(key=lambda item: (item.priority, item.label))
+    compact_limit = max(4, min(8, args.limit if args.commands else 5))
+    compact = suggestions[:compact_limit]
+    catalog = suggestions[: max(compact_limit, min(len(suggestions), max(args.limit + 6, 10)))]
+    return compact, catalog
+
+
+def build_daily_plan(
+    attention_items: list[ActionItem],
+    inbox_items: list[NotificationItem],
+    repo_health_matrix: list[RepoHealth],
+    failing_prs: list[PullRequest],
+    assigned_issues: list[Issue],
+    limit: int,
+) -> list[DailyPlanItem]:
+    plan: list[DailyPlanItem] = []
+
+    for pr in failing_prs[:2]:
+        plan.append(
+            DailyPlanItem(
+                summary=f"Fix failing checks on {pr.key}",
+                urgency="DO NOW",
+                reason="CI is failing on authored work",
+                command=pr_checks_command(pr),
+                priority=10,
+            )
+        )
+    for item in attention_items[:4]:
+        summary = item.title and f"{action_summary_verb(item)} {item.key}"
+        plan.append(
+            DailyPlanItem(
+                summary=summary or f"Triage {item.key}",
+                urgency=item.bucket,
+                reason=item.reason,
+                command=item.next_step,
+                priority=15 + bucket_rank(item.bucket) * 10,
+            )
+        )
+    for note in inbox_items[:2]:
+        plan.append(
+            DailyPlanItem(
+                summary=f"Reply on {note.repository} {notification_subject_label(note)}",
+                urgency="DO NOW" if note.unread else "WAITING",
+                reason=f"{note.reason_label} in inbox",
+                command=note.next_step,
+                priority=22 if note.unread else 38,
+            )
+        )
+    for issue in assigned_issues[:2]:
+        plan.append(
+            DailyPlanItem(
+                summary=f"Review assigned issue {issue.key}",
+                urgency="AT RISK" if issue.updated_at else "WAITING",
+                reason="assigned issue queue needs a decision",
+                command=issue_comments_command(issue),
+                priority=32,
+            )
+        )
+    for health in repo_health_matrix[:2]:
+        if health.failing_runs:
+            plan.append(
+                DailyPlanItem(
+                    summary=f"Triage repo health in {health.repository}",
+                    urgency="AT RISK",
+                    reason="recent CI failures are accumulating",
+                    command=f"gh run list --repo {health.repository} --limit {REPO_WORKFLOW_LIMIT}",
+                    priority=28,
+                )
+            )
+
+    deduped: list[DailyPlanItem] = []
+    seen: set[str] = set()
+    for item in sorted(plan, key=lambda entry: (entry.priority, entry.summary)):
+        if item.summary in seen:
+            continue
+        seen.add(item.summary)
+        deduped.append(item)
+        if len(deduped) >= limit:
+            break
+    return deduped
+
+
+def action_summary_verb(item: ActionItem) -> str:
+    if item.kind == "pr" and "REVIEW" in item.badges:
+        return "Review"
+    if item.kind == "issue":
+        return "Reply on"
+    if item.kind == "notification":
+        return "Check"
+    return "Triage"
+
+
+def notification_subject_label(note: NotificationItem) -> str:
+    if note.subject_type.lower() == "issue":
+        return f"issue update: {note.title}"
+    if note.subject_type.lower() == "pullrequest":
+        return f"PR thread: {note.title}"
+    return note.title
+
+
+def pr_web_command(pr: PullRequest) -> str:
+    return f"gh pr view {pr.number} -R {pr.repository} --web"
+
+
+def pr_checkout_command(pr: PullRequest) -> str:
+    return f"gh pr checkout {pr.number} -R {pr.repository}"
+
+
+def pr_checks_command(pr: PullRequest) -> str:
+    return f"gh pr checks {pr.number} -R {pr.repository}"
+
+
+def issue_comments_command(issue: Issue) -> str:
+    return f"gh issue view {issue.number} -R {issue.repository} --comments"
+
+
+def repo_view_command(repository: str) -> str:
+    return f"gh repo view {repository} --web"
+
+
+def pr_key_view_command(key: str) -> str:
+    repository, _, number = key.partition("#")
+    if repository and number.isdigit():
+        return f"gh pr view {number} -R {repository} --web"
+    return ""
+
+
+def issue_key_view_command(key: str) -> str:
+    repository, _, number = key.partition("#")
+    if repository and number.isdigit():
+        return f"gh issue view {number} -R {repository} --comments"
+    return ""
+
+
 def render_dashboard(data: DashboardData, args: argparse.Namespace, style: Style) -> None:
     width = resolve_width(args.width)
     print(render_title(data, width, style))
@@ -2142,6 +2630,11 @@ def render_dashboard(data: DashboardData, args: argparse.Namespace, style: Style
 
     print_box("Daily Brief", wrap_lines(data.daily_brief, width - 4), width, style)
     print()
+    if data.watch_mode:
+        print_box("Change Feed", render_change_feed_lines(data.change_feed, width, style), width, style, heavy=True)
+        print()
+    print_box("Daily Plan", render_daily_plan_lines(data.daily_plan, width, style), width, style)
+    print()
     print_box("Recent Wins", render_recent_wins_lines(data.recent_wins, data.generated_at, width, style), width, style)
     print()
     print_box(
@@ -2150,6 +2643,15 @@ def render_dashboard(data: DashboardData, args: argparse.Namespace, style: Style
         width,
         style,
     )
+    print()
+    print_box(
+        "Actionable Next Commands",
+        render_command_lines(data.command_catalog if args.commands else data.command_suggestions, width, style),
+        width,
+        style,
+    )
+    print()
+    print_box("Momentum Timeline", render_momentum_lines(data.momentum_timeline, width, style), width, style)
     print()
     print_box(
         "Changes Since Last Run",
@@ -2179,7 +2681,7 @@ def render_dashboard(data: DashboardData, args: argparse.Namespace, style: Style
 
 
 def render_title(data: DashboardData, width: int, style: Style) -> str:
-    left = f" GitPulse "
+    left = " GitPulse "
     right = f" {data.viewer_name} ({data.viewer_login}) "
     if data.focus_label != "all activity":
         right = f" {data.focus_label} | {data.viewer_login} "
@@ -2209,6 +2711,60 @@ def render_changes_lines(changes: list[str], style: Style, highlight: bool = Fal
         sign = change[0] if change and change[0] in "+-~" else ""
         prefix = bullet if not highlight else {"+" : "+", "-" : "-", "~" : "~"}.get(sign, bullet)
         lines.append(style.delta(f"{prefix} {change.lstrip('+-~') if highlight and sign else change}", sign))
+    return lines
+
+
+def render_change_feed_lines(events: list[ChangeEvent], width: int, style: Style) -> list[str]:
+    lines: list[str] = []
+    for event in events:
+        head = style.delta(f"{style.badge(event.badge)} {event.summary}", event.sign)
+        lines.append(truncate_ansi(head, width - 4))
+        if event.command:
+            lines.append(truncate_ansi(f"  {event.command}", width - 4))
+    return lines or [style.dim("No watch-mode changes to display.")]
+
+
+def render_daily_plan_lines(plan: list[DailyPlanItem], width: int, style: Style) -> list[str]:
+    if not plan:
+        return [style.dim("No concrete plan items were ranked from the current snapshot.")]
+    lines: list[str] = []
+    for index, item in enumerate(plan, start=1):
+        lines.append(truncate_ansi(f"{index}. {style.badge(item.urgency)} {item.summary}", width - 4))
+        detail = f"   {item.reason}"
+        if item.command:
+            detail += f" | {item.command}"
+        lines.append(truncate_ansi(detail, width - 4))
+    return lines
+
+
+def render_command_lines(commands: list[CommandSuggestion], width: int, style: Style) -> list[str]:
+    if not commands:
+        return [style.dim("No command recommendations surfaced from the current focus.")]
+    lines: list[str] = []
+    for item in commands:
+        lines.append(truncate_ansi(f"{style.badge('DO NOW' if item.priority < 20 else 'WAITING')} {item.label}", width - 4))
+        lines.append(truncate_ansi(f"  {item.command}", width - 4))
+        lines.append(truncate_ansi(f"  {item.reason}", width - 4))
+    return lines
+
+
+def render_momentum_lines(momentum: MomentumTimeline, width: int, style: Style) -> list[str]:
+    if momentum.fallback:
+        return [style.dim(momentum.fallback), style.dim(momentum.narrative)]
+
+    label_width = min(16, max(12, (width - 28) // 3))
+    lines = [momentum.narrative]
+    for metric in momentum.metrics:
+        spark = render_sparkline(metric.values, style)
+        sign = "+" if metric.delta > 0 else ("-" if metric.delta < 0 else "~")
+        delta = style.delta(f"{metric.delta:+d}", sign) if metric.delta else style.dim("0")
+        lines.append(
+            truncate_ansi(
+                f"{pad_plain(metric.label, label_width)} {spark}  now {metric.current}  prev {metric.previous}  delta {delta}",
+                width - 4,
+            )
+        )
+    lines.append(style.dim(f"{momentum.sample_count} snapshots across {momentum.span_days} days"))
     return lines
 
 
@@ -2830,11 +3386,51 @@ def render_markdown_export(data: DashboardData, args: argparse.Namespace) -> str
         "",
         data.daily_brief,
         "",
+        "## Daily Plan",
+        "",
+    ]
+    for item in data.daily_plan:
+        lines.append(f"- [{item.urgency}] {item.summary}")
+        lines.append(f"  Reason: {item.reason}")
+        if item.command:
+            lines.append(f"  Command: `{item.command}`")
+
+    lines.extend(
+        [
+            "",
+            "## Momentum Timeline",
+            "",
+            f"- {data.momentum_timeline.narrative}",
+        ]
+    )
+    if data.momentum_timeline.fallback:
+        lines.append(f"- {data.momentum_timeline.fallback}")
+    else:
+        for metric in data.momentum_timeline.metrics:
+            lines.append(
+                f"- {metric.label}: {render_sparkline(metric.values, Style())} now {metric.current}, prev {metric.previous}, delta {metric.delta:+d}"
+            )
+
+    lines.extend(
+        [
+            "",
+            "## Actionable Next Commands",
+            "",
+        ]
+    )
+    for item in data.command_catalog[: max(5, min(len(data.command_catalog), args.limit + 4))]:
+        lines.append(f"- {item.label}: `{item.command}`")
+        lines.append(f"  Why: {item.reason}")
+
+    lines.extend(
+        [
+            "",
         "## Recent Wins",
         "",
         data.recent_wins.narrative,
         "",
-    ]
+        ]
+    )
     for item in data.recent_wins.top_items[:RECENT_WINS_LIMIT]:
         lines.append(f"- `{item.kind}` `{item.key}` {item.title} ({relative_time(item.closed_at, data.generated_at)})")
 
@@ -2866,6 +3462,12 @@ def render_markdown_export(data: DashboardData, args: argparse.Namespace) -> str
                 f"- Period: {data.digest.period_label} ({data.digest.comparison_label})",
             ]
         )
+    if data.watch_mode:
+        lines.extend(["", "## Change Feed", ""])
+        for event in data.change_feed:
+            lines.append(f"- [{event.badge}] {event.summary}")
+            if event.command:
+                lines.append(f"  Command: `{event.command}`")
     lines.extend(
         [
             "",
@@ -2963,6 +3565,19 @@ def render_html_export(data: DashboardData, args: argparse.Namespace) -> str:
         for item in data.recent_wins.top_items[:RECENT_WINS_LIMIT]
     )
     attention_cards = "".join(render_attention_card_html(item) for item in data.attention_items[: min(len(data.attention_items), max(5, min(args.limit + 2, ATTENTION_LIMIT)))])
+    plan_items = "".join(
+        f"<li>{badge_html(item.urgency)} <strong>{h(item.summary)}</strong><br><span class='muted'>{h(item.reason)}</span>{render_cmd_html(item.command)}</li>"
+        for item in data.daily_plan
+    )
+    command_items = "".join(
+        f"<li><strong>{h(item.label)}</strong><br>{render_cmd_html(item.command)}<br><span class='muted'>{h(item.reason)}</span></li>"
+        for item in (data.command_catalog if args.commands else data.command_suggestions)
+    )
+    momentum_items = render_momentum_html(data.momentum_timeline)
+    watch_changes = "".join(
+        f"<li>{badge_html(event.badge)} {h(event.summary)}{render_cmd_html(event.command)}</li>"
+        for event in data.change_feed
+    )
     repo_rows = "".join(
         f"<tr><td>{h(repo.name)}</td><td>{h(relative_time(repo.pushed_at, data.generated_at))}</td><td>{h(repo.language)}</td><td>{repo.open_prs}/{repo.open_issues}</td><td>{h(repo.description or '')}</td></tr>"
         for repo in data.repos[: args.limit]
@@ -3086,6 +3701,14 @@ ul.changes li.tilde {{ color: #8a6400; }}
         <p>{h(data.daily_brief)}</p>
       </section>
       <section class="card">
+        <h2>Daily Plan</h2>
+        <ul>{plan_items or "<li>No plan items.</li>"}</ul>
+      </section>
+      <section class="card">
+        <h2>Momentum Timeline</h2>
+        {momentum_items}
+      </section>
+      <section class="card">
         <h2>Recent Wins</h2>
         <p>{h(data.recent_wins.narrative)}</p>
         <div class="metrics">
@@ -3110,9 +3733,15 @@ ul.changes li.tilde {{ color: #8a6400; }}
       <div class="attention">{attention_cards or "<p>No attention items.</p>"}</div>
     </section>
 
+    <section class="card">
+      <h2>Actionable Next Commands</h2>
+      <ul>{command_items or "<li>No command suggestions.</li>"}</ul>
+    </section>
+
     {render_digest_html(data.digest) if data.digest else ""}
 
     <div class="grid">
+      {f"<section class='card'><h2>Change Feed</h2><ul>{watch_changes}</ul></section>" if data.watch_mode else ""}
       <section class="card">
         <h2>Recent Changes</h2>
         <ul class="changes">{changes}</ul>
@@ -3188,6 +3817,23 @@ def render_digest_html(digest: DigestMetrics) -> str:
         f"<p class='muted'>{h(digest.period_label)} • {h(digest.comparison_label)}</p>"
         "</section>"
     )
+
+
+def render_cmd_html(command: str | None) -> str:
+    if not command:
+        return ""
+    return f"<div><span class='cmd'>{h(command)}</span></div>"
+
+
+def render_momentum_html(momentum: MomentumTimeline) -> str:
+    if momentum.fallback:
+        return f"<p>{h(momentum.narrative)}</p><p class='muted'>{h(momentum.fallback)}</p>"
+    items = "".join(
+        f"<li><strong>{h(metric.label)}</strong> {h(render_sparkline(metric.values, Style()))} "
+        f"<span class='muted'>now {metric.current}, prev {metric.previous}, delta {metric.delta:+d}</span></li>"
+        for metric in momentum.metrics
+    )
+    return f"<p>{h(momentum.narrative)}</p><ul>{items}</ul><p class='muted'>{momentum.sample_count} snapshots across {momentum.span_days} days</p>"
 
 
 def render_repo_health_detail_html(health: RepoHealth, now: datetime) -> str:

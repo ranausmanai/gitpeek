@@ -18,9 +18,12 @@ GitPulse turns your authenticated GitHub CLI session into a fast terminal snapsh
 - Issues assigned to you
 - Contribution heatmap, streaks, and recent-change detection
 - `Recent Wins` section for merged PRs and closed issues from the last 7 days
+- `Momentum Timeline` built from `~/.gitpulse/history.jsonl` with compact trend sparklines and workload narrative
+- `Daily Plan` with the top 3 to 5 recommended actions and urgency labels
+- `Actionable Next Commands` with copy-pasteable `gh` commands, plus `--commands` for an expanded command set
 - `Repo Health Matrix` across the top repos in scope, plus detailed drilldown with `--repo`
 - Focus modes for `--reviews`, `--failing`, `--stale`, `--inbox`, `--repo`, and `--org`
-- Watch mode with deltas between refreshes
+- Watch mode with deltas between refreshes and a watch-only `Change Feed`
 - Markdown, HTML, and plain-text standup exports
 - Config file and named profiles from `~/.gitpulse/config.json`
 
@@ -52,6 +55,7 @@ python3 gitpulse.py --limit 8 --digest daily
 python3 gitpulse.py --reviews
 python3 gitpulse.py --failing --repo owner/repo
 python3 gitpulse.py --stale --org my-org
+python3 gitpulse.py --commands
 python3 gitpulse.py --watch --interval 30
 python3 gitpulse.py --export-md standup.md --export-html standup.html
 python3 gitpulse.py --export-update update.txt --standup
@@ -70,8 +74,11 @@ python3 gitpulse.py
 That single command renders:
 
 - Daily brief
+- Daily plan
 - Recent wins
 - Attention radar
+- Actionable next commands
+- Momentum timeline
 - Optional digest section
 - Contribution heatmap and streaks
 - Repo health matrix
@@ -79,6 +86,7 @@ That single command renders:
 - Review queue
 - Failing or ready authored PRs
 - Assigned issues
+- Watch-only change feed when `--watch` is enabled
 - Detailed repo health drilldown when `--repo owner/name` is used
 
 ## ⚙️ Configuration And Profiles
@@ -105,6 +113,7 @@ Precedence is:
     "work": {
       "org": "acme",
       "reviews": true,
+      "commands": true,
       "watch": true,
       "interval": 45
     },
@@ -138,6 +147,8 @@ python3 gitpulse.py --export-update update.txt
 
 Exports include the new repo health and recent wins data where it fits naturally.
 
+Standup/update exports also carry the daily plan, momentum summary, and recommended commands. Markdown and HTML exports include dedicated sections for the momentum timeline and actionable commands.
+
 ## 🧭 Flags
 
 | Flag | Description |
@@ -158,10 +169,19 @@ Exports include the new repo health and recent wins data where it fits naturally
 | `--failing` | Focus on authored PRs with failing checks |
 | `--stale` | Focus on work stale for 3+ days |
 | `--inbox` | Focus on unread mentions, assignments, and review requests |
+| `--commands` | Expand the actionable command section with a larger set of `gh` commands |
 | `--digest daily\|weekly` | Add a digest section |
 | `--standup` | Print the compact team update to stdout |
 | `--repo OWNER/NAME` | Filter to one repository and show detailed repo health |
 | `--org ORGNAME` | Filter to repositories owned by one org |
+
+## 📈 Iteration 2 Additions
+
+- `Momentum Timeline` reuses `~/.gitpulse/history.jsonl` to trend review queue, assigned issues, failing PRs, and active repo counts across the last 7 to 14 days. Sparse history falls back to an explicit “need more snapshots” message.
+- `Daily Plan` ranks the highest-signal tasks from attention items, inbox activity, failing PRs, stale work, and repo health into a short decision-oriented list.
+- `Actionable Next Commands` surfaces repository-aware `gh` commands for review requests, authored PRs, failing checks, assigned issues, inbox items, and repo drilldowns.
+- `--commands` expands that command section without changing the underlying fetch or focus filters.
+- Watch mode now renders a `Change Feed` for newly arrived review requests, newly assigned issues, check-state flips, fresh repo pushes, and resolved work.
 
 ## 🧱 Architecture
 
