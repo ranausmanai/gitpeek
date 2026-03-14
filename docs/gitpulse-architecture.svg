@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="420" viewBox="0 0 980 420" role="img" aria-labelledby="title desc">
+  <title id="title">GitPulse architecture</title>
+  <desc id="desc">Single-file GitPulse flow from CLI and config through gh fetches into dashboard, exports, and cache.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0%" stop-color="#f4f8fb"/>
+      <stop offset="100%" stop-color="#e7eef6"/>
+    </linearGradient>
+    <linearGradient id="hero" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0%" stop-color="#15324d"/>
+      <stop offset="100%" stop-color="#1f6d7a"/>
+    </linearGradient>
+    <style>
+      .label { font: 600 16px system-ui, sans-serif; fill: #102033; }
+      .small { font: 500 13px system-ui, sans-serif; fill: #395066; }
+      .heroText { font: 700 18px system-ui, sans-serif; fill: #ffffff; }
+      .box { fill: #ffffff; stroke: #c9d8e6; stroke-width: 2; rx: 18; }
+      .arrow { stroke: #5a7188; stroke-width: 3; fill: none; marker-end: url(#m); }
+    </style>
+    <marker id="m" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#5a7188"/>
+    </marker>
+  </defs>
+
+  <rect width="980" height="420" fill="url(#bg)"/>
+
+  <rect x="40" y="36" width="210" height="86" rx="22" fill="url(#hero)"/>
+  <text x="66" y="74" class="heroText">gitpulse.py</text>
+  <text x="66" y="102" class="small" fill="#dcebf5">single-file runtime</text>
+
+  <rect x="40" y="172" width="210" height="90" class="box"/>
+  <text x="62" y="206" class="label">CLI + Config</text>
+  <text x="62" y="231" class="small">argparse</text>
+  <text x="62" y="251" class="small">~/.gitpulse/config.json</text>
+
+  <rect x="390" y="56" width="230" height="88" class="box"/>
+  <text x="415" y="91" class="label">GitHub Data Fetch</text>
+  <text x="415" y="116" class="small">`gh api user`</text>
+  <text x="415" y="136" class="small">GraphQL + search + notifications</text>
+
+  <rect x="390" y="180" width="230" height="104" class="box"/>
+  <text x="415" y="215" class="label">Dashboard Model</text>
+  <text x="415" y="240" class="small">repos, review queue, issues</text>
+  <text x="415" y="260" class="small">repo health matrix</text>
+  <text x="415" y="280" class="small">recent wins, digest, streaks</text>
+
+  <rect x="730" y="40" width="200" height="82" class="box"/>
+  <text x="754" y="74" class="label">Terminal Render</text>
+  <text x="754" y="99" class="small">boxes, tables, ANSI color</text>
+
+  <rect x="730" y="150" width="200" height="82" class="box"/>
+  <text x="754" y="184" class="label">Exports</text>
+  <text x="754" y="209" class="small">Markdown, HTML, text update</text>
+
+  <rect x="730" y="260" width="200" height="94" class="box"/>
+  <text x="754" y="294" class="label">History + Cache</text>
+  <text x="754" y="319" class="small">cache.json</text>
+  <text x="754" y="339" class="small">history.jsonl</text>
+
+  <path d="M250 79 H375" class="arrow"/>
+  <path d="M145 172 V132" class="arrow"/>
+  <path d="M505 144 V170" class="arrow"/>
+  <path d="M620 97 H715" class="arrow"/>
+  <path d="M620 232 H715" class="arrow"/>
+  <path d="M620 250 C675 250, 690 300, 715 307" class="arrow"/>
+</svg>

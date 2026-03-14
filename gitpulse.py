@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import html
 import json
 import os
@@ -19,9 +20,11 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-CACHE_VERSION = 2
+CACHE_VERSION = 3
 CACHE_DIR = Path.home() / ".gitpulse"
 CACHE_PATH = CACHE_DIR / "cache.json"
+HISTORY_PATH = CACHE_DIR / "history.jsonl"
+DEFAULT_CONFIG_PATH = CACHE_DIR / "config.json"
 
 DEFAULT_INTERVAL = 60
 STREAK_DAYS = 365
@@ -33,6 +36,12 @@ ISSUE_FETCH_FLOOR = 40
 ATTENTION_LIMIT = 8
 STALE_DAYS = 3
 FAILING_RISK_HOURS = 24
+HISTORY_LIMIT = 90
+NOTIFICATION_FETCH_LIMIT = 25
+REPO_WORKFLOW_LIMIT = 8
+WEEKLY_WINDOW_DAYS = 7
+REPO_HEALTH_MATRIX_LIMIT = 5
+RECENT_WINS_LIMIT = 6
 
 BLOCKS = {
     "unicode": {
@@ -65,6 +74,29 @@ BLOCKS = {
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 REPO_RE = re.compile(r"^[^/\s]+/[^/\s]+$")
+
+BUILTIN_DEFAULTS: dict[str, Any] = {
+    "limit": 6,
+    "width": "auto",
+    "refresh": False,
+    "no_cache": False,
+    "watch": False,
+    "interval": DEFAULT_INTERVAL,
+    "iterations": None,
+    "export_md": None,
+    "export_html": None,
+    "export_update": None,
+    "reviews": False,
+    "failing": False,
+    "stale": False,
+    "inbox": False,
+    "digest": None,
+    "standup": False,
+    "repo": None,
+    "org": None,
+}
+
+CONFIGURABLE_OPTIONS = set(BUILTIN_DEFAULTS)
 
 PR_FIELDS = """
 fragment PrFields on PullRequest {
@@ -296,6 +328,95 @@ class ActionItem:
 
 
 @dataclass
+class NotificationItem:
+    id: str
+    repository: str
+    subject_type: str
+    title: str
+    reason: str
+    updated_at: datetime | None
+    url: str
+    unread: bool
+    last_read_at: datetime | None
+    score: int
+    reason_label: str
+    next_step: str
+
+    @property
+    def key(self) -> str:
+        return f"{self.repository}:{self.id}"
+
+
+@dataclass
+class DigestDelta:
+    value: int
+    previous: int
+    delta: int
+
+
+@dataclass
+class DigestMetrics:
+    mode: str
+    period_label: str
+    comparison_label: str
+    merged_authored_prs: DigestDelta
+    reviews_completed: DigestDelta
+    issues_closed: DigestDelta
+    active_repos_touched: DigestDelta
+    streak_change: DigestDelta
+    narrative: str
+
+
+@dataclass
+class RepoHealth:
+    repository: str
+    workflow_runs: list[dict[str, Any]]
+    failing_runs: int
+    successful_runs: int
+    oldest_open_pr: PullRequest | None
+    oldest_open_issue: Issue | None
+    merge_ready_prs: list[PullRequest]
+    latest_release: dict[str, Any] | None
+    next_steps: list[str]
+    notes: list[str]
+
+
+@dataclass
+class RecentWinItem:
+    kind: str
+    repository: str
+    number: int
+    title: str
+    url: str
+    closed_at: datetime | None
+
+    @property
+    def key(self) -> str:
+        return f"{self.repository}#{self.number}"
+
+
+@dataclass
+class RecentWins:
+    merged_prs: list[RecentWinItem]
+    closed_issues: list[RecentWinItem]
+    merged_pr_count: int
+    closed_issue_count: int
+    narrative: str
+
+    @property
+    def total_count(self) -> int:
+        return self.merged_pr_count + self.closed_issue_count
+
+    @property
+    def top_items(self) -> list[RecentWinItem]:
+        return sorted(
+            [*self.merged_prs, *self.closed_issues],
+            key=lambda item: item.closed_at or epoch_utc(),
+            reverse=True,
+        )
+
+
+@dataclass
 class DashboardData:
     generated_at: datetime
     viewer_login: str
@@ -307,6 +428,12 @@ class DashboardData:
     ready_prs: list[PullRequest]
     assigned_issues: list[Issue]
     attention_items: list[ActionItem]
+    notifications: list[NotificationItem]
+    inbox_items: list[NotificationItem]
+    repo_health_matrix: list[RepoHealth]
+    repo_health: RepoHealth | None
+    recent_wins: RecentWins
+    digest: DigestMetrics | None
     contribution_weeks: list[list[dict[str, Any]]]
     contribution_days: list[dict[str, Any]]
     current_streak: int
@@ -319,6 +446,7 @@ class DashboardData:
     summary: dict[str, int]
     focus_label: str
     subtitle: str
+    share_update: str
     cache_used: bool
     watch_iteration: int = 1
     watch_total: int | None = None
@@ -392,47 +520,32 @@ class Style:
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        prog="gitpulse.py",
-        description="Render a GitHub terminal dashboard powered by gh.",
-    )
-    parser.add_argument("--limit", type=int, default=6, help="Rows to show per section (default: 6).")
-    parser.add_argument(
-        "--width",
-        choices=["auto", "full"],
-        default="auto",
-        help="Clamp layout for readability or use the full terminal width.",
-    )
-    parser.add_argument(
-        "--refresh",
-        action="store_true",
-        help="Ignore the previous disk cache snapshot but write a new one at the end.",
-    )
-    parser.add_argument(
-        "--no-cache",
-        action="store_true",
-        help="Disable disk cache reads and writes for this run.",
-    )
-    parser.add_argument("--watch", action="store_true", help="Refresh the dashboard continuously.")
-    parser.add_argument(
-        "--interval",
-        type=int,
-        default=DEFAULT_INTERVAL,
-        help=f"Refresh interval in watch mode (default: {DEFAULT_INTERVAL}).",
-    )
-    parser.add_argument(
-        "--iterations",
-        type=int,
-        help="Stop after N watch iterations. Useful for tests.",
-    )
-    parser.add_argument("--export-md", metavar="PATH", help="Write a Markdown standup export.")
-    parser.add_argument("--export-html", metavar="PATH", help="Write a self-contained HTML export.")
-    parser.add_argument("--reviews", action="store_true", help="Focus on review-requested PRs.")
-    parser.add_argument("--failing", action="store_true", help="Focus on authored PRs with failing checks.")
-    parser.add_argument("--stale", action="store_true", help="Focus on work stale for 3+ days.")
-    parser.add_argument("--repo", metavar="OWNER/NAME", help="Filter to a single repository.")
-    parser.add_argument("--org", metavar="ORGNAME", help="Filter to repositories owned by one org.")
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument("--config", metavar="PATH")
+    config_parser.add_argument("--profile", metavar="NAME")
+    early_args, _ = config_parser.parse_known_args(argv)
+
+    config_path = Path(os.path.expanduser(early_args.config)) if early_args.config else DEFAULT_CONFIG_PATH
+    try:
+        config_payload = load_config(config_path)
+    except GhError as exc:
+        config_parser.error(str(exc))
+
+    merged_defaults = dict(BUILTIN_DEFAULTS)
+    merged_defaults.update(config_payload["defaults"])
+    if early_args.profile:
+        profiles = config_payload["profiles"]
+        if early_args.profile not in profiles:
+            available = ", ".join(sorted(profiles)) or "none"
+            config_parser.error(f"Unknown profile '{early_args.profile}'. Available profiles: {available}.")
+        merged_defaults.update(profiles[early_args.profile])
+
+    parser = build_parser(merged_defaults)
     args = parser.parse_args(argv)
+    args.config_path = config_path
+
+    explicit_interval = has_flag(argv, "--interval")
+    explicit_iterations = has_flag(argv, "--iterations")
 
     if args.limit < 1:
         parser.error("--limit must be at least 1.")
@@ -440,13 +553,158 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--interval must be at least 1.")
     if args.iterations is not None and args.iterations < 1:
         parser.error("--iterations must be at least 1.")
-    if not args.watch and args.interval != DEFAULT_INTERVAL:
+    if not args.watch and explicit_interval and args.interval != DEFAULT_INTERVAL:
         parser.error("--interval requires --watch.")
-    if not args.watch and args.iterations is not None:
+    if not args.watch and explicit_iterations and args.iterations is not None:
         parser.error("--iterations requires --watch.")
     if args.repo and not REPO_RE.match(args.repo):
         parser.error("--repo must look like OWNER/NAME.")
+    if args.standup and args.watch:
+        parser.error("--standup is not supported with --watch.")
     return args
+
+
+def build_parser(defaults: dict[str, Any]) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="gitpulse.py",
+        description="Render a GitHub terminal dashboard powered by gh.",
+    )
+    parser.add_argument("--config", metavar="PATH", default=str(DEFAULT_CONFIG_PATH), help="Override the config file path.")
+    parser.add_argument("--profile", metavar="NAME", help="Use a named profile from the config file.")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=defaults["limit"],
+        help=f"Rows to show per section (default: {defaults['limit']}).",
+    )
+    parser.add_argument(
+        "--width",
+        choices=["auto", "full"],
+        default=defaults["width"],
+        help="Clamp layout for readability or use the full terminal width.",
+    )
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        default=bool(defaults["refresh"]),
+        help="Ignore the previous disk cache snapshot but write a new one at the end.",
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        default=bool(defaults["no_cache"]),
+        help="Disable disk cache reads and writes for this run.",
+    )
+    parser.add_argument(
+        "--watch",
+        action="store_true",
+        default=bool(defaults["watch"]),
+        help="Refresh the dashboard continuously.",
+    )
+    parser.add_argument(
+        "--interval",
+        type=int,
+        default=defaults["interval"],
+        help=f"Refresh interval in watch mode (default: {defaults['interval']}).",
+    )
+    parser.add_argument(
+        "--iterations",
+        default=defaults["iterations"],
+        type=int,
+        help="Stop after N watch iterations. Useful for tests.",
+    )
+    parser.add_argument("--export-md", metavar="PATH", default=defaults["export_md"], help="Write a Markdown standup export.")
+    parser.add_argument("--export-html", metavar="PATH", default=defaults["export_html"], help="Write a self-contained HTML export.")
+    parser.add_argument("--export-update", metavar="PATH", default=defaults["export_update"], help="Write a compact team update in plain text.")
+    parser.add_argument("--reviews", action="store_true", default=bool(defaults["reviews"]), help="Focus on review-requested PRs.")
+    parser.add_argument("--failing", action="store_true", default=bool(defaults["failing"]), help="Focus on authored PRs with failing checks.")
+    parser.add_argument("--stale", action="store_true", default=bool(defaults["stale"]), help="Focus on work stale for 3+ days.")
+    parser.add_argument("--inbox", action="store_true", default=bool(defaults["inbox"]), help="Focus on unread mentions, assignments, and review requests.")
+    parser.add_argument(
+        "--digest",
+        choices=["daily", "weekly"],
+        default=defaults["digest"],
+        help="Show a digest section for the current snapshot or a trailing weekly comparison.",
+    )
+    parser.add_argument("--standup", action="store_true", default=bool(defaults["standup"]), help="Print a compact paste-ready team update to stdout.")
+    parser.add_argument("--repo", metavar="OWNER/NAME", default=defaults["repo"], help="Filter to a single repository.")
+    parser.add_argument("--org", metavar="ORGNAME", default=defaults["org"], help="Filter to repositories owned by one org.")
+    return parser
+
+
+def has_flag(argv: list[str], flag: str) -> bool:
+    return any(token == flag or token.startswith(f"{flag}=") for token in argv)
+
+
+def load_config(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {"defaults": {}, "profiles": {}}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise GhError(f"Unable to read config file {path}: {exc}.") from exc
+    except json.JSONDecodeError as exc:
+        raise GhError(f"Config file {path} does not contain valid JSON: {exc}.") from exc
+
+    if not isinstance(payload, dict):
+        raise GhError(f"Config file {path} must contain a JSON object.")
+
+    unknown_top_level = sorted(set(payload) - {"defaults", "profiles"} - CONFIGURABLE_OPTIONS)
+    if unknown_top_level:
+        raise GhError(f"Unknown config keys: {', '.join(unknown_top_level)}.")
+
+    raw_defaults = payload.get("defaults")
+    if raw_defaults is not None and not isinstance(raw_defaults, dict):
+        raise GhError("Config `defaults` must be an object.")
+    defaults = dict(raw_defaults or {})
+    inline_defaults = {key: value for key, value in payload.items() if key in CONFIGURABLE_OPTIONS}
+    defaults = {**defaults, **inline_defaults}
+    raw_profiles = payload.get("profiles")
+    if raw_profiles is not None and not isinstance(raw_profiles, dict):
+        raise GhError("Config `profiles` must be an object keyed by profile name.")
+    profiles = raw_profiles or {}
+
+    validate_config_values(defaults, "defaults")
+    for profile_name, values in profiles.items():
+        if not isinstance(profile_name, str) or not profile_name.strip():
+            raise GhError("Profile names must be non-empty strings.")
+        if not isinstance(values, dict):
+            raise GhError(f"Profile '{profile_name}' must be a JSON object.")
+        validate_config_values(values, f"profile '{profile_name}'")
+    return {"defaults": defaults, "profiles": profiles}
+
+
+def validate_config_values(values: dict[str, Any], label: str) -> None:
+    unknown_keys = sorted(set(values) - CONFIGURABLE_OPTIONS)
+    if unknown_keys:
+        raise GhError(f"Unknown keys in {label}: {', '.join(unknown_keys)}.")
+
+    for key, value in values.items():
+        if key in {"limit", "interval"}:
+            if not is_positive_int(value):
+                raise GhError(f"{label} field `{key}` must be a positive integer.")
+        elif key == "iterations":
+            if value is not None and not is_positive_int(value):
+                raise GhError(f"{label} field `{key}` must be null or a positive integer.")
+        elif key == "width":
+            if value not in {"auto", "full"}:
+                raise GhError(f"{label} field `width` must be `auto` or `full`.")
+        elif key == "digest":
+            if value is not None and value not in {"daily", "weekly"}:
+                raise GhError(f"{label} field `digest` must be `daily`, `weekly`, or null.")
+        elif key == "repo":
+            if value is not None and (not isinstance(value, str) or not REPO_RE.match(value)):
+                raise GhError(f"{label} field `repo` must look like OWNER/NAME.")
+        elif key in {"org", "export_md", "export_html", "export_update"}:
+            if value is not None and not isinstance(value, str):
+                raise GhError(f"{label} field `{key}` must be a string or null.")
+        elif key in {"refresh", "no_cache", "watch", "reviews", "failing", "stale", "inbox", "standup"}:
+            if not isinstance(value, bool):
+                raise GhError(f"{label} field `{key}` must be true or false.")
+
+
+def is_positive_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -460,8 +718,9 @@ def main(argv: list[str] | None = None) -> int:
         data = build_dashboard(args, previous_snapshot=previous_snapshot, cache_used=previous_snapshot is not None)
         render_dashboard(data, args, style)
         export_outputs(data, args)
-        if not args.no_cache:
-            write_cache(snapshot_from_dashboard(data))
+        persist_run_state(data, args, write_history=True)
+        if args.standup:
+            print(data.share_update)
         return 0
     except GhError as exc:
         print(style.bad(f"GitPulse error: {exc}"), file=sys.stderr)
@@ -492,8 +751,12 @@ def run_watch_mode(args: argparse.Namespace, style: Style) -> int:
         previous_snapshot = current_snapshot
         cache_used = False
 
-        if not args.no_cache:
-            write_cache(current_snapshot)
+        persist_run_state(
+            data,
+            args,
+            write_history=bool(args.iterations is not None and iteration >= args.iterations),
+            snapshot=current_snapshot,
+        )
 
         if args.iterations is not None and iteration >= args.iterations:
             return 0
@@ -502,6 +765,20 @@ def run_watch_mode(args: argparse.Namespace, style: Style) -> int:
             time_module.sleep(args.interval)
         except KeyboardInterrupt:
             return 130
+
+
+def persist_run_state(
+    data: DashboardData,
+    args: argparse.Namespace,
+    write_history: bool,
+    snapshot: dict[str, Any] | None = None,
+) -> None:
+    if args.no_cache:
+        return
+    snapshot = snapshot or snapshot_from_dashboard(data)
+    write_cache(snapshot)
+    if write_history:
+        append_history(snapshot)
 
 
 def build_dashboard(
@@ -543,14 +820,30 @@ def build_dashboard(
     review_prs = parse_prs(payload.get("reviewRequested", {}).get("nodes", []), viewer_login)
     authored_prs = parse_prs(payload.get("authored", {}).get("nodes", []), viewer_login)
     assigned_issues = parse_issues(payload.get("assignedIssues", {}).get("nodes", []))
+    notifications = fetch_notifications(args, generated_at)
 
-    repos, review_prs, authored_prs, assigned_issues = apply_filters(
-        repos, review_prs, authored_prs, assigned_issues, args, generated_at
+    repos, review_prs, authored_prs, assigned_issues, notifications = apply_filters(
+        repos, review_prs, authored_prs, assigned_issues, notifications, args, generated_at
     )
 
-    attention_items = build_attention_items(review_prs, authored_prs, assigned_issues, generated_at, args.limit)
+    recent_wins = fetch_recent_wins(viewer_login, generated_at, RECENT_WINS_LIMIT)
+    attention_items = build_attention_items(
+        review_prs, authored_prs, assigned_issues, notifications, generated_at, args.limit
+    )
     failing_prs = [pr for pr in authored_prs if pr.check_state in {"FAILURE", "ERROR"}]
     ready_prs = [pr for pr in authored_prs if is_ready_pr(pr)]
+    inbox_items = notifications[: args.limit]
+    repo_health_targets = [repo.name for repo in repos[:REPO_HEALTH_MATRIX_LIMIT]]
+    if args.repo and args.repo not in repo_health_targets:
+        repo_health_targets.insert(0, args.repo)
+    repo_health_lookup = fetch_repo_health_collection(
+        repo_health_targets,
+        viewer_login,
+        limit=REPO_HEALTH_MATRIX_LIMIT + (1 if args.repo else 0),
+        detailed_repo=args.repo,
+    )
+    repo_health_matrix = [repo_health_lookup[name] for name in repo_health_targets if name in repo_health_lookup][:REPO_HEALTH_MATRIX_LIMIT]
+    repo_health = repo_health_lookup.get(args.repo) if args.repo else None
 
     contribution_weeks = parse_contribution_weeks(
         viewer_data.get("contributionsCollection", {}).get("contributionCalendar", {}).get("weeks", [])
@@ -579,14 +872,40 @@ def build_dashboard(
         "reviews_waiting": len(review_prs),
         "failing_prs": len(failing_prs),
         "assigned_issues": len(assigned_issues),
+        "inbox_unread": sum(1 for item in notifications if item.unread),
+        "mentions": sum(1 for item in notifications if item.reason == "mention"),
+        "review_requests": sum(1 for item in notifications if item.reason == "review_requested"),
         "attention_now": sum(1 for item in attention_items if item.bucket == "DO NOW"),
         "attention_risk": sum(1 for item in attention_items if item.bucket == "AT RISK"),
         "current_streak": current_streak,
+        "recent_win_total": recent_wins.total_count,
+        "recent_merged_prs": recent_wins.merged_pr_count,
+        "recent_closed_issues": recent_wins.closed_issue_count,
     }
     focus_label = build_focus_label(args)
     subtitle = build_subtitle(args)
-    daily_brief = build_daily_brief(summary, repos, attention_items, focus_label)
-    changes = build_changes(previous_snapshot, repos, review_prs, authored_prs, assigned_issues, current_streak, generated_at)
+    daily_brief = build_daily_brief(summary, repos, attention_items, recent_wins, focus_label)
+    changes = build_changes(
+        previous_snapshot,
+        repos,
+        review_prs,
+        authored_prs,
+        assigned_issues,
+        notifications,
+        current_streak,
+        generated_at,
+    )
+    history = read_history()
+    digest = build_digest(args, history, generated_at, viewer_login, current_streak)
+    share_update = build_share_update(
+        summary=summary,
+        attention_items=attention_items,
+        notifications=notifications,
+        digest=digest,
+        recent_wins=recent_wins,
+        repo_health=repo_health,
+        focus_label=focus_label,
+    )
 
     return DashboardData(
         generated_at=generated_at,
@@ -599,6 +918,12 @@ def build_dashboard(
         ready_prs=ready_prs,
         assigned_issues=assigned_issues,
         attention_items=attention_items,
+        notifications=notifications,
+        inbox_items=inbox_items,
+        repo_health_matrix=repo_health_matrix,
+        repo_health=repo_health,
+        recent_wins=recent_wins,
+        digest=digest,
         contribution_weeks=contribution_weeks,
         contribution_days=contribution_days,
         current_streak=current_streak,
@@ -611,6 +936,7 @@ def build_dashboard(
         summary=summary,
         focus_label=focus_label,
         subtitle=subtitle,
+        share_update=share_update,
         cache_used=cache_used,
     )
 
@@ -761,19 +1087,523 @@ def parse_check_state(node: dict[str, Any]) -> str:
     return rollup.get("state") or "UNKNOWN"
 
 
+def fetch_notifications(args: argparse.Namespace, now: datetime) -> list[NotificationItem]:
+    with contextlib.suppress(GhError):
+        payload = run_gh_json(
+            [
+                "api",
+                f"notifications?all=false&participating=false&per_page={NOTIFICATION_FETCH_LIMIT}",
+            ]
+        )
+        if isinstance(payload, list):
+            notifications = [notification_from_api(node, now) for node in payload]
+            ranked = [item for item in notifications if item is not None]
+            ranked.sort(
+                key=lambda item: (
+                    -item.score,
+                    0 if item.unread else 1,
+                    -(item.updated_at.timestamp() if item.updated_at else 0),
+                    item.repository.lower(),
+                )
+            )
+            return ranked
+    return []
+
+
+def notification_from_api(node: dict[str, Any], now: datetime) -> NotificationItem | None:
+    if not node:
+        return None
+    repo_name = ((node.get("repository") or {}).get("full_name") or "unknown/unknown").strip()
+    updated_at = parse_dt(node.get("updated_at"))
+    last_read_at = parse_dt(node.get("last_read_at"))
+    subject = node.get("subject") or {}
+    subject_type = (subject.get("type") or "Notification").strip()
+    reason = (node.get("reason") or "unknown").strip()
+    metadata = notification_reason_metadata(reason)
+    title = (subject.get("title") or f"{subject_type} update").strip()
+    url, next_step = resolve_notification_target(repo_name, subject_type, subject.get("url"), subject.get("latest_comment_url"))
+    score = metadata["score"] + stale_score(updated_at, now)
+    if node.get("unread", False):
+        score += 8
+    return NotificationItem(
+        id=str(node.get("id") or title),
+        repository=repo_name,
+        subject_type=subject_type,
+        title=title,
+        reason=reason,
+        updated_at=updated_at,
+        url=url,
+        unread=bool(node.get("unread")),
+        last_read_at=last_read_at,
+        score=score,
+        reason_label=metadata["label"],
+        next_step=next_step,
+    )
+
+
+def notification_reason_metadata(reason: str) -> dict[str, Any]:
+    mapping = {
+        "review_requested": {"label": "Review Request", "score": 130},
+        "mention": {"label": "Mention", "score": 126},
+        "assign": {"label": "Assigned", "score": 118},
+        "author": {"label": "Author Update", "score": 86},
+        "comment": {"label": "Comment", "score": 82},
+        "subscribed": {"label": "Subscribed", "score": 72},
+    }
+    return mapping.get(reason, {"label": reason.replace("_", " ").title() or "Notification", "score": 64})
+
+
+def resolve_notification_target(
+    repository: str,
+    subject_type: str,
+    subject_url: str | None,
+    latest_comment_url: str | None,
+) -> tuple[str, str]:
+    candidate = latest_comment_url or subject_url or ""
+    if not candidate:
+        return "", f"gh notification view --repo {repository}"
+    if candidate.startswith("https://github.com/"):
+        return candidate, command_for_subject_url(repository, subject_type, candidate)
+
+    patterns = [
+        (r"/repos/([^/]+/[^/]+)/pulls/(\d+)$", lambda repo, num: (f"https://github.com/{repo}/pull/{num}", f"gh pr view {repo}#{num} --web")),
+        (r"/repos/([^/]+/[^/]+)/issues/(\d+)$", lambda repo, num: (f"https://github.com/{repo}/issues/{num}", f"gh issue view {repo}#{num} --web")),
+        (
+            r"/repos/([^/]+/[^/]+)/pulls/comments/(\d+)$",
+            lambda repo, num: (f"https://github.com/{repo}/pulls", f"gh repo view {repo} --web"),
+        ),
+        (
+            r"/repos/([^/]+/[^/]+)/commits/([0-9a-fA-F]+)$",
+            lambda repo, sha: (f"https://github.com/{repo}/commit/{sha}", f"gh browse {repo} -- commit/{sha}"),
+        ),
+        (
+            r"/repos/([^/]+/[^/]+)/releases/(\d+)$",
+            lambda repo, rel_id: (f"https://github.com/{repo}/releases", f"gh release view --repo {repo} {rel_id}"),
+        ),
+    ]
+    for pattern, builder in patterns:
+        match = re.search(pattern, candidate)
+        if match:
+            return builder(*match.groups())
+    return candidate, command_for_subject_url(repository, subject_type, candidate)
+
+
+def command_for_subject_url(repository: str, subject_type: str, url: str) -> str:
+    lowered = subject_type.lower()
+    if "pull" in lowered:
+        return f"gh pr view --repo {repository} --web"
+    if "issue" in lowered:
+        return f"gh issue view --repo {repository} --web"
+    if "release" in lowered:
+        return f"gh release list --repo {repository} --limit 1"
+    return f"gh repo view {repository} --web"
+
+
+def fetch_repo_health(repository: str, viewer_login: str) -> RepoHealth | None:
+    return fetch_repo_health_summary(repository, viewer_login, verify_exists=True)
+
+
+def fetch_repo_health_collection(
+    repositories: list[str],
+    viewer_login: str,
+    limit: int,
+    detailed_repo: str | None = None,
+) -> dict[str, RepoHealth]:
+    collected: dict[str, RepoHealth] = {}
+    for repository in unique_preserving_order(repositories):
+        if len(collected) >= limit and repository != detailed_repo:
+            break
+        health = fetch_repo_health_summary(
+            repository,
+            viewer_login,
+            verify_exists=repository == detailed_repo,
+        )
+        if health is not None:
+            collected[repository] = health
+    return collected
+
+
+def fetch_repo_health_summary(
+    repository: str,
+    viewer_login: str,
+    verify_exists: bool = False,
+) -> RepoHealth | None:
+    notes: list[str] = []
+    workflow_runs: list[dict[str, Any]] = []
+    failing_runs = 0
+    successful_runs = 0
+    oldest_open_pr: PullRequest | None = None
+    oldest_open_issue: Issue | None = None
+    merge_ready_prs: list[PullRequest] = []
+    latest_release: dict[str, Any] | None = None
+
+    if verify_exists:
+        repo_payload = run_gh_json(["api", f"repos/{repository}"])
+        if repo_payload.get("full_name") != repository:
+            raise GhError(f"Repository {repository} was not found.")
+
+    try:
+        workflows_payload = run_gh_json(["api", f"repos/{repository}/actions/runs?per_page={REPO_WORKFLOW_LIMIT}"])
+        workflow_runs = workflows_payload.get("workflow_runs", [])[:REPO_WORKFLOW_LIMIT]
+        for run in workflow_runs:
+            conclusion = (run.get("conclusion") or "").lower()
+            status = (run.get("status") or "").lower()
+            if conclusion == "success":
+                successful_runs += 1
+            elif conclusion in {"failure", "timed_out", "cancelled", "action_required", "startup_failure"}:
+                failing_runs += 1
+            elif status == "completed":
+                notes.append("Some recent workflow runs completed without a clear conclusion.")
+    except GhError as exc:
+        notes.append(f"Workflow data unavailable: {exc}")
+
+    try:
+        prs_payload = run_gh_json(
+            [
+                "api",
+                "graphql",
+                "-f",
+                "query="
+                + repo_health_query(),
+                "-F",
+                f"repo={repository.split('/')[0]}",
+                "-F",
+                f"name={repository.split('/')[1]}",
+                "-F",
+                f"viewer={viewer_login}",
+            ]
+        )
+        repo_data = ((prs_payload.get("data") or {}).get("repository") or {})
+        oldest_open_pr = parse_repo_pr_node(((repo_data.get("oldestPrs") or {}).get("nodes") or [None])[0], viewer_login)
+        oldest_open_issue = parse_repo_issue_node(((repo_data.get("oldestIssues") or {}).get("nodes") or [None])[0])
+        merge_ready_prs = [
+            pr for pr in (parse_repo_pr_node(node, viewer_login) for node in ((repo_data.get("mergeReadyPrs") or {}).get("nodes") or []))
+            if pr and is_ready_pr(pr)
+        ]
+        release = repo_data.get("latestRelease")
+        if release:
+            latest_release = {
+                "name": release.get("name") or release.get("tagName") or "latest",
+                "tag_name": release.get("tagName") or "",
+                "published_at": parse_dt(release.get("publishedAt")),
+                "url": release.get("url") or "",
+                "is_draft": bool(release.get("isDraft")),
+                "is_prerelease": bool(release.get("isPrerelease")),
+            }
+    except GhError as exc:
+        notes.append(f"Repo deep-dive data unavailable: {exc}")
+
+    next_steps = build_repo_health_next_steps(repository, workflow_runs, merge_ready_prs, oldest_open_pr, oldest_open_issue)
+    return RepoHealth(
+        repository=repository,
+        workflow_runs=workflow_runs,
+        failing_runs=failing_runs,
+        successful_runs=successful_runs,
+        oldest_open_pr=oldest_open_pr,
+        oldest_open_issue=oldest_open_issue,
+        merge_ready_prs=merge_ready_prs,
+        latest_release=latest_release,
+        next_steps=next_steps,
+        notes=notes,
+    )
+
+
+def fetch_recent_wins(viewer_login: str, now: datetime, limit: int) -> RecentWins:
+    start = now - timedelta(days=WEEKLY_WINDOW_DAYS)
+    merged_query = (
+        f"is:pr is:merged archived:false author:{viewer_login} "
+        f"sort:updated-desc merged:{start.date()}..{now.date()}"
+    )
+    closed_query = (
+        f"is:issue is:closed archived:false assignee:{viewer_login} "
+        f"sort:updated-desc closed:{start.date()}..{now.date()}"
+    )
+    merged_payload = run_gh_json(["api", "search/issues", "-f", f"q={merged_query}", "-f", f"per_page={limit}"])
+    closed_payload = run_gh_json(["api", "search/issues", "-f", f"q={closed_query}", "-f", f"per_page={limit}"])
+    merged_prs = parse_recent_win_items(merged_payload.get("items", []), kind="Merged PR", timestamp_key="closed_at")
+    closed_issues = parse_recent_win_items(closed_payload.get("items", []), kind="Closed issue", timestamp_key="closed_at")
+    merged_count = int(merged_payload.get("total_count") or 0)
+    closed_count = int(closed_payload.get("total_count") or 0)
+    return RecentWins(
+        merged_prs=merged_prs,
+        closed_issues=closed_issues,
+        merged_pr_count=merged_count,
+        closed_issue_count=closed_count,
+        narrative=build_recent_wins_narrative(merged_count, closed_count),
+    )
+
+
+def parse_recent_win_items(items: list[dict[str, Any]], kind: str, timestamp_key: str) -> list[RecentWinItem]:
+    parsed: list[RecentWinItem] = []
+    for item in items:
+        repo_url = item.get("repository_url") or ""
+        repository = repo_url.rsplit("/repos/", 1)[-1] if "/repos/" in repo_url else "unknown/unknown"
+        parsed.append(
+            RecentWinItem(
+                kind=kind,
+                repository=repository,
+                number=int(item.get("number") or 0),
+                title=item.get("title", ""),
+                url=item.get("html_url", ""),
+                closed_at=parse_dt(item.get(timestamp_key)),
+            )
+        )
+    return parsed
+
+
+def build_recent_wins_narrative(merged_count: int, closed_count: int) -> str:
+    if merged_count == 0 and closed_count == 0:
+        return "No completed work landed in the last 7 days."
+    parts = []
+    if merged_count:
+        parts.append(f"merged {merged_count} PR{'s' if merged_count != 1 else ''}")
+    if closed_count:
+        parts.append(f"closed {closed_count} issue{'s' if closed_count != 1 else ''}")
+    joined = " and ".join(parts)
+    return f"In the last 7 days you {joined}."
+
+
+def repo_health_query() -> str:
+    return """
+query RepoHealth($repo: String!, $name: String!, $viewer: String!) {
+  repository(owner: $repo, name: $name) {
+    oldestPrs: pullRequests(first: 1, states: OPEN, orderBy: {field: CREATED_AT, direction: ASC}) {
+      nodes {
+        ...PrFields
+      }
+    }
+    mergeReadyPrs: pullRequests(first: 8, states: OPEN, orderBy: {field: UPDATED_AT, direction: DESC}) {
+      nodes {
+        ...PrFields
+      }
+    }
+    oldestIssues: issues(first: 1, states: OPEN, orderBy: {field: CREATED_AT, direction: ASC}) {
+      nodes {
+        ...IssueFields
+      }
+    }
+    latestRelease {
+      name
+      tagName
+      publishedAt
+      url
+      isDraft
+      isPrerelease
+    }
+  }
+}
+""" + PR_FIELDS + ISSUE_FIELDS
+
+
+def parse_repo_pr_node(node: dict[str, Any] | None, viewer_login: str) -> PullRequest | None:
+    if not node:
+        return None
+    prs = parse_prs([node], viewer_login)
+    return prs[0] if prs else None
+
+
+def parse_repo_issue_node(node: dict[str, Any] | None) -> Issue | None:
+    if not node:
+        return None
+    issues = parse_issues([node])
+    return issues[0] if issues else None
+
+
+def build_repo_health_next_steps(
+    repository: str,
+    workflow_runs: list[dict[str, Any]],
+    merge_ready_prs: list[PullRequest],
+    oldest_open_pr: PullRequest | None,
+    oldest_open_issue: Issue | None,
+) -> list[str]:
+    steps: list[str] = []
+    if workflow_runs and any((run.get("conclusion") or "").lower() == "failure" for run in workflow_runs):
+        steps.append(f"gh run list --repo {repository} --limit {REPO_WORKFLOW_LIMIT}")
+    if merge_ready_prs:
+        steps.append(f"gh pr view {merge_ready_prs[0].key} --web")
+    if oldest_open_pr:
+        steps.append(f"gh pr view {oldest_open_pr.key} --web")
+    if oldest_open_issue:
+        steps.append(f"gh issue view {oldest_open_issue.key} --web")
+    if not steps:
+        steps.append(f"gh repo view {repository} --web")
+    return unique_preserving_order(steps)[:4]
+
+
+def build_digest(
+    args: argparse.Namespace,
+    history: list[dict[str, Any]],
+    now: datetime,
+    viewer_login: str,
+    current_streak: int,
+) -> DigestMetrics | None:
+    if not args.digest:
+        return None
+    if args.digest == "daily":
+        local_now = now.astimezone()
+        current_start = datetime.combine(local_now.date(), time.min, tzinfo=local_now.tzinfo).astimezone(timezone.utc)
+        current = fetch_digest_window(viewer_login, current_start, now)
+        return DigestMetrics(
+            mode="daily",
+            period_label=local_now.strftime("%Y-%m-%d"),
+            comparison_label="today",
+            merged_authored_prs=DigestDelta(current["merged_authored_prs"], current["merged_authored_prs"], 0),
+            reviews_completed=DigestDelta(current["reviews_completed"], current["reviews_completed"], 0),
+            issues_closed=DigestDelta(current["issues_closed"], current["issues_closed"], 0),
+            active_repos_touched=DigestDelta(current["active_repos_touched"], current["active_repos_touched"], 0),
+            streak_change=DigestDelta(current_streak, current_streak, 0),
+            narrative=build_digest_narrative(
+                "daily",
+                current["merged_authored_prs"],
+                current["reviews_completed"],
+                current["issues_closed"],
+                current["active_repos_touched"],
+                0,
+            ),
+        )
+
+    current_start = now - timedelta(days=WEEKLY_WINDOW_DAYS)
+    previous_start = now - timedelta(days=WEEKLY_WINDOW_DAYS * 2)
+    current = fetch_digest_window(viewer_login, current_start, now)
+    previous = fetch_digest_window(viewer_login, previous_start, current_start)
+    streak_previous = history_streak_at_or_before(history, current_start) or current_streak
+    return DigestMetrics(
+        mode="weekly",
+        period_label=f"{current_start.astimezone().date()} to {now.astimezone().date()}",
+        comparison_label=f"vs {previous_start.astimezone().date()} to {current_start.astimezone().date()}",
+        merged_authored_prs=make_delta(current["merged_authored_prs"], previous["merged_authored_prs"]),
+        reviews_completed=make_delta(current["reviews_completed"], previous["reviews_completed"]),
+        issues_closed=make_delta(current["issues_closed"], previous["issues_closed"]),
+        active_repos_touched=make_delta(current["active_repos_touched"], previous["active_repos_touched"]),
+        streak_change=make_delta(current_streak, streak_previous),
+        narrative=build_digest_narrative(
+            "weekly",
+            current["merged_authored_prs"],
+            current["reviews_completed"],
+            current["issues_closed"],
+            current["active_repos_touched"],
+            current_streak - streak_previous,
+        ),
+    )
+
+
+def fetch_digest_window(viewer_login: str, start: datetime, end: datetime) -> dict[str, int]:
+    merged = search_issue_count(
+        f"is:pr is:merged archived:false author:{viewer_login} merged:{start.date()}..{end.date()}"
+    )
+    reviewed = search_issue_count(
+        f"is:pr archived:false reviewed-by:{viewer_login} updated:{start.date()}..{end.date()}"
+    )
+    closed = search_issue_count(
+        f"is:issue archived:false assignee:{viewer_login} closed:{start.date()}..{end.date()}"
+    )
+    touched_repos = search_repositories_touched(viewer_login, start, end)
+    return {
+        "merged_authored_prs": merged,
+        "reviews_completed": reviewed,
+        "issues_closed": closed,
+        "active_repos_touched": touched_repos,
+    }
+
+
+def search_issue_count(query: str) -> int:
+    payload = run_gh_json(["api", "search/issues", "-f", f"q={query}", "-f", "per_page=1"])
+    return int(payload.get("total_count") or 0)
+
+
+def search_repositories_touched(viewer_login: str, start: datetime, end: datetime) -> int:
+    queries = [
+        f"is:pr archived:false author:{viewer_login} updated:{start.date()}..{end.date()}",
+        f"is:pr archived:false reviewed-by:{viewer_login} updated:{start.date()}..{end.date()}",
+        f"is:issue archived:false assignee:{viewer_login} updated:{start.date()}..{end.date()}",
+    ]
+    repos: set[str] = set()
+    for query in queries:
+        payload = run_gh_json(["api", "search/issues", "-f", f"q={query}", "-f", "per_page=25"])
+        for item in payload.get("items", []):
+            repo_url = item.get("repository_url") or ""
+            if "/repos/" in repo_url:
+                repos.add(repo_url.rsplit("/repos/", 1)[-1])
+    return len(repos)
+
+
+def make_delta(current: int, previous: int) -> DigestDelta:
+    return DigestDelta(value=current, previous=previous, delta=current - previous)
+
+
+def build_digest_narrative(
+    mode: str,
+    merged_authored_prs: int,
+    reviews_completed: int,
+    issues_closed: int,
+    active_repos_touched: int,
+    streak_delta: int,
+) -> str:
+    streak_phrase = "held steady" if streak_delta == 0 else ("extended" if streak_delta > 0 else "slipped")
+    period = "Today" if mode == "daily" else "This week"
+    return (
+        f"{period} you merged {merged_authored_prs} PRs you authored and completed {reviews_completed} review cycles. "
+        f"You closed {issues_closed} assigned issues across {active_repos_touched} active repos. "
+        f"Your contribution streak {streak_phrase}{'' if streak_delta == 0 else f' by {abs(streak_delta)} day' + ('s' if abs(streak_delta) != 1 else '')}."
+    )
+
+
+def build_share_update(
+    summary: dict[str, int],
+    attention_items: list[ActionItem],
+    notifications: list[NotificationItem],
+    digest: DigestMetrics | None,
+    recent_wins: RecentWins,
+    repo_health: RepoHealth | None,
+    focus_label: str,
+) -> str:
+    wins = [recent_wins.narrative]
+    if digest:
+        wins.append(digest.narrative)
+    elif summary["active_repos"]:
+        wins.append(f"Touched {summary['active_repos']} active repos with a {summary['current_streak']}-day contribution streak.")
+    blockers = [item for item in attention_items if item.bucket == "AT RISK"][:2]
+    asks = [item for item in notifications if item.reason in {"review_requested", "mention", "assign"}][:2]
+    next_items = attention_items[:2]
+    if repo_health and repo_health.merge_ready_prs:
+        next_items = [action_for_authored_pr(repo_health.merge_ready_prs[0], datetime.now(timezone.utc)) or next_items[0]]
+
+    lines = [f"Focus: {focus_label}"]
+    lines.append("Wins:")
+    lines.append(f"- {wins[0] if wins else 'No standout wins surfaced from the current snapshot.'}")
+    lines.append("Blockers:")
+    if blockers:
+        for item in blockers:
+            lines.append(f"- {item.repository} {item.key}: {item.reason}")
+    else:
+        lines.append("- No major blockers surfaced.")
+    lines.append("Review asks:")
+    if asks:
+        for note in asks:
+            lines.append(f"- {note.repository}: {note.reason_label} on {note.title}")
+    else:
+        lines.append("- No urgent review asks right now.")
+    lines.append("Next:")
+    for item in next_items:
+        lines.append(f"- {item.repository}: {item.next_step}")
+    return "\n".join(lines)
+
+
 def apply_filters(
     repos: list[Repo],
     review_prs: list[PullRequest],
     authored_prs: list[PullRequest],
     assigned_issues: list[Issue],
+    notifications: list[NotificationItem],
     args: argparse.Namespace,
     now: datetime,
-) -> tuple[list[Repo], list[PullRequest], list[PullRequest], list[Issue]]:
+) -> tuple[list[Repo], list[PullRequest], list[PullRequest], list[Issue], list[NotificationItem]]:
     if args.repo:
         repos = [repo for repo in repos if repo.name == args.repo]
         review_prs = [pr for pr in review_prs if pr.repository == args.repo]
         authored_prs = [pr for pr in authored_prs if pr.repository == args.repo]
         assigned_issues = [issue for issue in assigned_issues if issue.repository == args.repo]
+        notifications = [item for item in notifications if item.repository == args.repo]
 
     if args.org:
         prefix = f"{args.org}/"
@@ -781,6 +1611,7 @@ def apply_filters(
         review_prs = [pr for pr in review_prs if pr.repository.startswith(prefix)]
         authored_prs = [pr for pr in authored_prs if pr.repository.startswith(prefix)]
         assigned_issues = [issue for issue in assigned_issues if issue.repository.startswith(prefix)]
+        notifications = [item for item in notifications if item.repository.startswith(prefix)]
 
     if args.reviews:
         review_prs = sorted(
@@ -798,15 +1629,23 @@ def apply_filters(
         review_prs = sort_by_staleness(review_prs, now)
         authored_prs = sort_by_staleness(authored_prs, now)
         assigned_issues = sort_by_staleness(assigned_issues, now)
+        notifications = sort_by_staleness(notifications, now)
         repos = sorted(repos, key=lambda repo: age_key(repo.pushed_at, now), reverse=True)
 
-    return repos, review_prs, authored_prs, assigned_issues
+    if args.inbox:
+        notifications = sorted(
+            notifications,
+            key=lambda item: (-item.score, 0 if item.unread else 1, -(item.updated_at.timestamp() if item.updated_at else 0)),
+        )
+
+    return repos, review_prs, authored_prs, assigned_issues, notifications
 
 
 def build_attention_items(
     review_prs: list[PullRequest],
     authored_prs: list[PullRequest],
     assigned_issues: list[Issue],
+    notifications: list[NotificationItem],
     now: datetime,
     limit: int,
 ) -> list[ActionItem]:
@@ -828,6 +1667,10 @@ def build_attention_items(
         item = action_for_issue(issue, now)
         items[f"issue:{issue.id}"] = item
 
+    for notification in notifications[: max(limit + 2, 6)]:
+        item = action_for_notification(notification, now)
+        items[f"notification:{notification.id}"] = item
+
     ranked = sorted(
         items.values(),
         key=lambda item: (
@@ -838,6 +1681,30 @@ def build_attention_items(
         ),
     )
     return ranked[: max(ATTENTION_LIMIT, limit)]
+
+
+def action_for_notification(notification: NotificationItem, now: datetime) -> ActionItem:
+    bucket = "DO NOW" if notification.reason in {"review_requested", "mention", "assign"} else "WAITING"
+    if is_stale(notification.updated_at, now) and bucket != "DO NOW":
+        bucket = "AT RISK"
+    badges = unique_preserving_order([bucket, notification.reason_label.upper()[:12], "UNREAD" if notification.unread else ""])
+    return ActionItem(
+        key=notification.key,
+        kind="notification",
+        repository=notification.repository,
+        title=notification.title,
+        url=notification.url,
+        number=0,
+        created_at=notification.updated_at,
+        updated_at=notification.updated_at,
+        badges=badges[:3],
+        score=notification.score,
+        check_state="",
+        reason=f"{notification.reason_label.lower()} {relative_time_long(notification.updated_at, now)} ago",
+        next_step=notification.next_step,
+        age_bucket=age_bucket(notification.updated_at, now),
+        bucket=bucket,
+    )
 
 
 def action_for_review_pr(pr: PullRequest, now: datetime) -> ActionItem:
@@ -1092,13 +1959,20 @@ def build_subtitle(args: argparse.Namespace) -> str:
     return f"Focus: {build_focus_label(args)}"
 
 
-def build_daily_brief(summary: dict[str, int], repos: list[Repo], attention_items: list[ActionItem], focus_label: str) -> str:
+def build_daily_brief(
+    summary: dict[str, int],
+    repos: list[Repo],
+    attention_items: list[ActionItem],
+    recent_wins: RecentWins | None,
+    focus_label: str,
+) -> str:
     if attention_items:
         standout = f"Top action: {attention_items[0].repository} ({attention_items[0].reason})."
     elif repos:
         standout = f"Biggest movement: {repos[0].name}."
     else:
         standout = "No matching GitHub activity surfaced."
+    wins_sentence = recent_wins.narrative if recent_wins else "No recent wins summary available."
     return (
         f"Focus: {focus_label}. "
         f"{summary['active_repos']} active repos, "
@@ -1107,6 +1981,7 @@ def build_daily_brief(summary: dict[str, int], repos: list[Repo], attention_item
         f"{summary['assigned_issues']} assigned issues, "
         f"{summary['attention_now']} do-now items, "
         f"streak {summary['current_streak']} days. "
+        f"{wins_sentence} "
         f"{standout}"
     )
 
@@ -1195,6 +2070,10 @@ def snapshot_from_dashboard(data: DashboardData) -> dict[str, Any]:
         "pr_check_states": {pr.key: pr.check_state for pr in data.authored_prs},
         "ready_pr_ids": [pr.key for pr in data.ready_prs],
         "current_streak": data.current_streak,
+        "merged_authored_prs": data.recent_wins.merged_pr_count,
+        "reviews_completed": data.digest.reviews_completed.value if data.digest else 0,
+        "issues_closed": data.recent_wins.closed_issue_count,
+        "active_repos_touched": data.summary["active_repos"],
     }
 
 
@@ -1218,6 +2097,40 @@ def write_cache(snapshot: dict[str, Any]) -> None:
         raise GhError(f"Unable to write cache file {CACHE_PATH}: {exc}.") from exc
 
 
+def append_history(snapshot: dict[str, Any]) -> None:
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        with HISTORY_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(snapshot, sort_keys=True) + "\n")
+    except OSError as exc:
+        raise GhError(f"Unable to write history file {HISTORY_PATH}: {exc}.") from exc
+
+
+def read_history() -> list[dict[str, Any]]:
+    if not HISTORY_PATH.exists():
+        return []
+    history: list[dict[str, Any]] = []
+    try:
+        with HISTORY_PATH.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                with contextlib.suppress(json.JSONDecodeError):
+                    history.append(json.loads(line))
+    except OSError:
+        return []
+    return history[-HISTORY_LIMIT:]
+
+
+def history_streak_at_or_before(history: list[dict[str, Any]], target: datetime) -> int | None:
+    for entry in reversed(history):
+        generated_at = parse_dt(entry.get("generated_at"))
+        if generated_at and generated_at <= target:
+            return int(entry.get("current_streak") or 0)
+    return None
+
+
 def render_dashboard(data: DashboardData, args: argparse.Namespace, style: Style) -> None:
     width = resolve_width(args.width)
     print(render_title(data, width, style))
@@ -1228,6 +2141,8 @@ def render_dashboard(data: DashboardData, args: argparse.Namespace, style: Style
     print()
 
     print_box("Daily Brief", wrap_lines(data.daily_brief, width - 4), width, style)
+    print()
+    print_box("Recent Wins", render_recent_wins_lines(data.recent_wins, data.generated_at, width, style), width, style)
     print()
     print_box(
         "Attention Radar",
@@ -1244,7 +2159,12 @@ def render_dashboard(data: DashboardData, args: argparse.Namespace, style: Style
         heavy=data.watch_mode,
     )
     print()
+    if data.digest:
+        print_box("Digest", render_digest_lines(data.digest, style), width, style)
+        print()
     print_box("Contributions", render_contribution_lines(data, width, style), width, style)
+    print()
+    print_box("Repo Health Matrix", render_repo_health_matrix_lines(data.repo_health_matrix, data.generated_at, width, style), width, style)
     print()
     print_box("Repos By Recent Activity", render_repo_lines(data.repos, args.limit, data.generated_at, width, style), width, style)
     print()
@@ -1253,6 +2173,9 @@ def render_dashboard(data: DashboardData, args: argparse.Namespace, style: Style
     print_box("Failing Or Ready PRs", render_authored_pr_lines(data, args.limit, data.generated_at, width, style), width, style)
     print()
     print_box("Issues Assigned To You", render_issue_lines(data.assigned_issues, args.limit, data.generated_at, width, style), width, style)
+    if data.repo_health:
+        print()
+        print_box(f"Repo Health Drilldown: {data.repo_health.repository}", render_repo_health_detail_lines(data.repo_health, data.generated_at, width, style), width, style)
 
 
 def render_title(data: DashboardData, width: int, style: Style) -> str:
@@ -1330,6 +2253,48 @@ def render_contribution_lines(data: DashboardData, width: int, style: Style) -> 
     return lines
 
 
+def render_recent_wins_lines(wins: RecentWins, now: datetime, width: int, style: Style) -> list[str]:
+    lines = wrap_lines(wins.narrative, width - 4)
+    if wins.total_count == 0:
+        return lines
+    lines.append(
+        f"Merged PRs {style.good(str(wins.merged_pr_count))}  "
+        f"Closed issues {style.cool(str(wins.closed_issue_count))}"
+    )
+    for item in wins.top_items[:RECENT_WINS_LIMIT]:
+        lines.append(
+            truncate_ansi(
+                f"{style.badge('READY' if item.kind == 'Merged PR' else 'ASSIGNED')} "
+                f"{item.key} {truncate_plain(item.title, max(width - 26, 18))} "
+                f"{style.dim(relative_time(item.closed_at, now))}",
+                width - 4,
+            )
+        )
+    return lines
+
+
+def render_digest_lines(digest: DigestMetrics, style: Style) -> list[str]:
+    return [
+        digest.narrative,
+        (
+            f"Merged {format_delta(digest.merged_authored_prs, style)}  "
+            f"Reviews {format_delta(digest.reviews_completed, style)}  "
+            f"Issues {format_delta(digest.issues_closed, style)}  "
+            f"Repos {format_delta(digest.active_repos_touched, style)}  "
+            f"Streak {format_delta(digest.streak_change, style, suffix='d')}"
+        ),
+        f"{digest.period_label} {style.dim(digest.comparison_label)}",
+    ]
+
+
+def format_delta(delta: DigestDelta, style: Style, suffix: str = "") -> str:
+    sign = "+" if delta.delta > 0 else ("-" if delta.delta < 0 else "~")
+    base = f"{delta.value}{suffix}"
+    if delta.delta == 0:
+        return style.delta(base, sign)
+    return style.delta(f"{base} ({delta.delta:+d})", sign)
+
+
 def render_repo_lines(repos: list[Repo], limit: int, now: datetime, width: int, style: Style) -> list[str]:
     if not repos:
         return [style.dim("No repositories matched the current focus.")]
@@ -1360,6 +2325,99 @@ def render_repo_lines(repos: list[Repo], limit: int, now: datetime, width: int, 
         )
     append_more_line(lines, len(repos), limit, style)
     return lines
+
+
+def render_repo_health_matrix_lines(health_rows: list[RepoHealth], now: datetime, width: int, style: Style) -> list[str]:
+    if not health_rows:
+        return [style.dim("No repositories were available for a health scan in the current focus.")]
+
+    inner = max(width - 4, 20)
+    repo_width = min(24, max(14, inner // 5))
+    ci_width = 16
+    age_width = 9
+    release_width = 18
+    note_width = max(inner - repo_width - ci_width - age_width - age_width - release_width - 10, 16)
+    lines = [
+        f"{style.dim(pad_plain('Repo', repo_width))}  "
+        f"{style.dim(pad_plain('CI', ci_width))}  "
+        f"{style.dim(pad_plain('Oldest PR', age_width))}  "
+        f"{style.dim(pad_plain('Oldest Issue', age_width))}  "
+        f"{style.dim(pad_plain('Release', release_width))}  "
+        f"{style.dim('Next')}"
+    ]
+    for health in health_rows:
+        lines.append(
+            f"{pad_plain(truncate_plain(health.repository, repo_width), repo_width)}  "
+            f"{pad_plain(truncate_plain(repo_health_workflow_summary(health), ci_width), ci_width)}  "
+            f"{pad_plain(repo_health_item_age(health.oldest_open_pr, now), age_width)}  "
+            f"{pad_plain(repo_health_item_age(health.oldest_open_issue, now), age_width)}  "
+            f"{pad_plain(truncate_plain(repo_health_release_label(health, now), release_width), release_width)}  "
+            f"{truncate_plain(repo_health_warning(health, now), note_width)}"
+        )
+    return lines
+
+
+def render_repo_health_detail_lines(health: RepoHealth, now: datetime, width: int, style: Style) -> list[str]:
+    lines = [
+        f"Workflow runs: {repo_health_workflow_summary(health)}",
+        f"Oldest open PR: {repo_health_detail_label(health.oldest_open_pr, now, empty='No open PRs.')}",
+        f"Oldest open issue: {repo_health_detail_label(health.oldest_open_issue, now, empty='No open issues.')}",
+        f"Latest release: {repo_health_release_label(health, now)}",
+        f"Suggested next step: {repo_health_warning(health, now)}",
+    ]
+    if health.next_steps:
+        lines.append(f"Command: {health.next_steps[0]}")
+    for note in health.notes:
+        lines.extend(wrap_lines(f"Note: {note}", width - 4))
+    return lines
+
+
+def repo_health_workflow_summary(health: RepoHealth) -> str:
+    if not health.workflow_runs:
+        return "n/a"
+    pending = sum(1 for run in health.workflow_runs if (run.get("status") or "").lower() != "completed")
+    parts = []
+    if health.failing_runs:
+        parts.append(f"{health.failing_runs} fail")
+    if health.successful_runs:
+        parts.append(f"{health.successful_runs} ok")
+    if pending:
+        parts.append(f"{pending} running")
+    return ", ".join(parts) if parts else "recent runs"
+
+
+def repo_health_item_age(item: PullRequest | Issue | None, now: datetime) -> str:
+    if item is None:
+        return "none"
+    return relative_time(item.created_at or item.updated_at, now)
+
+
+def repo_health_release_label(health: RepoHealth, now: datetime) -> str:
+    if not health.latest_release:
+        return "none"
+    tag = health.latest_release.get("tag_name") or health.latest_release.get("name") or "latest"
+    published_at = health.latest_release.get("published_at")
+    return f"{tag} {relative_time(published_at, now)}"
+
+
+def repo_health_warning(health: RepoHealth, now: datetime) -> str:
+    if health.failing_runs:
+        return "CI failures need triage"
+    if health.merge_ready_prs:
+        return f"Merge-ready PR waiting: {health.merge_ready_prs[0].key}"
+    if health.oldest_open_pr and is_older_than(health.oldest_open_pr.created_at, now, hours=24 * 7):
+        return "Old PR is aging"
+    if health.oldest_open_issue and is_older_than(health.oldest_open_issue.created_at, now, hours=24 * 14):
+        return "Old issue needs a decision"
+    if health.notes:
+        return truncate_plain(health.notes[0], 38)
+    return "Healthy"
+
+
+def repo_health_detail_label(item: PullRequest | Issue | None, now: datetime, empty: str) -> str:
+    if item is None:
+        return empty
+    return f"{item.key} {truncate_plain(item.title, 48)} ({repo_health_item_age(item, now)} old)"
 
 
 def render_review_lines(prs: list[PullRequest], limit: int, now: datetime, width: int, style: Style) -> list[str]:
@@ -1741,6 +2799,10 @@ def export_outputs(data: DashboardData, args: argparse.Namespace) -> None:
         path = Path(args.export_html)
         path.write_text(render_html_export(data, args), encoding="utf-8")
         print(f"Wrote HTML export to {path}")
+    if args.export_update:
+        path = Path(args.export_update)
+        path.write_text(data.share_update + "\n", encoding="utf-8")
+        print(f"Wrote text update to {path}")
 
 
 def render_markdown_export(data: DashboardData, args: argparse.Namespace) -> str:
@@ -1757,6 +2819,9 @@ def render_markdown_export(data: DashboardData, args: argparse.Namespace) -> str
         f"- Reviews waiting: {data.summary['reviews_waiting']}",
         f"- Failing PRs: {data.summary['failing_prs']}",
         f"- Assigned issues: {data.summary['assigned_issues']}",
+        f"- Recent wins: {data.summary['recent_win_total']}",
+        f"- Merged PRs this week: {data.summary['recent_merged_prs']}",
+        f"- Closed issues this week: {data.summary['recent_closed_issues']}",
         f"- Do now: {data.summary['attention_now']}",
         f"- At risk: {data.summary['attention_risk']}",
         f"- Streak: {data.current_streak} days",
@@ -1765,9 +2830,22 @@ def render_markdown_export(data: DashboardData, args: argparse.Namespace) -> str
         "",
         data.daily_brief,
         "",
-        "## Attention Radar",
+        "## Recent Wins",
+        "",
+        data.recent_wins.narrative,
         "",
     ]
+    for item in data.recent_wins.top_items[:RECENT_WINS_LIMIT]:
+        lines.append(f"- `{item.kind}` `{item.key}` {item.title} ({relative_time(item.closed_at, data.generated_at)})")
+
+    lines.extend(
+        [
+            "",
+            "## Attention Radar",
+            "",
+        ]
+    )
+
     for item in data.attention_items[: min(len(data.attention_items), max(5, min(args.limit + 2, ATTENTION_LIMIT)))]:
         lines.extend(
             [
@@ -1777,6 +2855,17 @@ def render_markdown_export(data: DashboardData, args: argparse.Namespace) -> str
             ]
         )
 
+    lines.extend(section_repo_health_markdown("## Repo Health Matrix", data.repo_health_matrix, data.generated_at))
+    if data.digest:
+        lines.extend(
+            [
+                "",
+                "## Digest",
+                "",
+                f"- {data.digest.narrative}",
+                f"- Period: {data.digest.period_label} ({data.digest.comparison_label})",
+            ]
+        )
     lines.extend(
         [
             "",
@@ -1792,6 +2881,8 @@ def render_markdown_export(data: DashboardData, args: argparse.Namespace) -> str
     lines.extend(section_pr_markdown("## Review Queue", data.review_prs, data.generated_at, args.limit))
     lines.extend(section_pr_markdown("## Failing Or Ready PRs", unique_pr_list(data.failing_prs + data.ready_prs), data.generated_at, args.limit))
     lines.extend(section_issue_markdown("## Assigned Issues", data.assigned_issues, data.generated_at, args.limit))
+    if data.repo_health:
+        lines.extend(section_repo_health_detail_markdown(data.repo_health, data.generated_at))
     lines.extend(
         [
             "",
@@ -1833,11 +2924,52 @@ def section_issue_markdown(title: str, issues: list[Issue], now: datetime, limit
     return lines
 
 
+def section_repo_health_markdown(title: str, health_rows: list[RepoHealth], now: datetime) -> list[str]:
+    lines = ["", title, ""]
+    if not health_rows:
+        lines.append("- None")
+        return lines
+    lines.append("| Repo | CI | Oldest PR | Oldest Issue | Release | Next |")
+    lines.append("| --- | --- | --- | --- | --- | --- |")
+    for health in health_rows:
+        lines.append(
+            f"| {health.repository} | {repo_health_workflow_summary(health)} | {repo_health_item_age(health.oldest_open_pr, now)} | "
+            f"{repo_health_item_age(health.oldest_open_issue, now)} | {repo_health_release_label(health, now)} | {repo_health_warning(health, now)} |"
+        )
+    return lines
+
+
+def section_repo_health_detail_markdown(health: RepoHealth, now: datetime) -> list[str]:
+    lines = [
+        "",
+        f"## Repo Health Drilldown: {health.repository}",
+        "",
+        f"- Workflow runs: {repo_health_workflow_summary(health)}",
+        f"- Oldest open PR: {repo_health_detail_label(health.oldest_open_pr, now, empty='No open PRs.')}",
+        f"- Oldest open issue: {repo_health_detail_label(health.oldest_open_issue, now, empty='No open issues.')}",
+        f"- Latest release: {repo_health_release_label(health, now)}",
+        f"- Next step: {repo_health_warning(health, now)}",
+    ]
+    if health.next_steps:
+        lines.append(f"- Command: `{health.next_steps[0]}`")
+    for note in health.notes:
+        lines.append(f"- Note: {note}")
+    return lines
+
+
 def render_html_export(data: DashboardData, args: argparse.Namespace) -> str:
+    wins_items = "".join(
+        f"<li><strong>{h(item.kind)}</strong> {h(item.key)} {h(item.title)} <span class='muted'>{h(relative_time(item.closed_at, data.generated_at))}</span></li>"
+        for item in data.recent_wins.top_items[:RECENT_WINS_LIMIT]
+    )
     attention_cards = "".join(render_attention_card_html(item) for item in data.attention_items[: min(len(data.attention_items), max(5, min(args.limit + 2, ATTENTION_LIMIT)))])
     repo_rows = "".join(
         f"<tr><td>{h(repo.name)}</td><td>{h(relative_time(repo.pushed_at, data.generated_at))}</td><td>{h(repo.language)}</td><td>{repo.open_prs}/{repo.open_issues}</td><td>{h(repo.description or '')}</td></tr>"
         for repo in data.repos[: args.limit]
+    )
+    repo_health_rows = "".join(
+        f"<tr><td>{h(health.repository)}</td><td>{h(repo_health_workflow_summary(health))}</td><td>{h(repo_health_item_age(health.oldest_open_pr, data.generated_at))}</td><td>{h(repo_health_item_age(health.oldest_open_issue, data.generated_at))}</td><td>{h(repo_health_release_label(health, data.generated_at))}</td><td>{h(repo_health_warning(health, data.generated_at))}</td></tr>"
+        for health in data.repo_health_matrix
     )
     review_rows = "".join(render_pr_row_html(pr, data.generated_at) for pr in data.review_prs[: args.limit])
     authored_rows = "".join(render_pr_row_html(pr, data.generated_at) for pr in unique_pr_list(data.failing_prs + data.ready_prs)[: args.limit])
@@ -1894,6 +3026,7 @@ body {{
   min-width: 120px;
 }}
 .metric strong {{ display: block; font-size: 22px; }}
+.muted {{ color: #5d7084; }}
 .badge {{
   display: inline-block;
   border-radius: 999px;
@@ -1953,6 +3086,15 @@ ul.changes li.tilde {{ color: #8a6400; }}
         <p>{h(data.daily_brief)}</p>
       </section>
       <section class="card">
+        <h2>Recent Wins</h2>
+        <p>{h(data.recent_wins.narrative)}</p>
+        <div class="metrics">
+          <div class="metric"><span>Merged PRs</span><strong>{data.recent_wins.merged_pr_count}</strong></div>
+          <div class="metric"><span>Closed issues</span><strong>{data.recent_wins.closed_issue_count}</strong></div>
+        </div>
+        <ul>{wins_items or "<li>No recent wins.</li>"}</ul>
+      </section>
+      <section class="card">
         <h2>Summary Metrics</h2>
         <div class="metrics">
           <div class="metric"><span>Active repos</span><strong>{data.summary['active_repos']}</strong></div>
@@ -1967,6 +3109,8 @@ ul.changes li.tilde {{ color: #8a6400; }}
       <h2>Attention Radar</h2>
       <div class="attention">{attention_cards or "<p>No attention items.</p>"}</div>
     </section>
+
+    {render_digest_html(data.digest) if data.digest else ""}
 
     <div class="grid">
       <section class="card">
@@ -1984,6 +3128,10 @@ ul.changes li.tilde {{ color: #8a6400; }}
     </div>
 
     <section class="card">
+      <h2>Repo Health Matrix</h2>
+      <table><thead><tr><th>Repo</th><th>CI</th><th>Oldest PR</th><th>Oldest issue</th><th>Release</th><th>Next</th></tr></thead><tbody>{repo_health_rows or "<tr><td colspan='6'>None</td></tr>"}</tbody></table>
+    </section>
+    <section class="card">
       <h2>Active Repos</h2>
       <table><thead><tr><th>Repo</th><th>Last Push</th><th>Language</th><th>Open</th><th>Description</th></tr></thead><tbody>{repo_rows or "<tr><td colspan='5'>None</td></tr>"}</tbody></table>
     </section>
@@ -1999,6 +3147,7 @@ ul.changes li.tilde {{ color: #8a6400; }}
       <h2>Assigned Issues</h2>
       <table><thead><tr><th>Issue</th><th>Title</th><th>Updated</th></tr></thead><tbody>{issue_rows or "<tr><td colspan='3'>None</td></tr>"}</tbody></table>
     </section>
+    {render_repo_health_detail_html(data.repo_health, data.generated_at) if data.repo_health else ""}
   </div>
 </body>
 </html>
@@ -2029,6 +3178,33 @@ def badge_html(label: str) -> str:
         "READY": "green",
     }.get(label, "gray")
     return f"<span class='badge {css}'>{h(label)}</span>"
+
+
+def render_digest_html(digest: DigestMetrics) -> str:
+    return (
+        "<section class='card'>"
+        "<h2>Digest</h2>"
+        f"<p>{h(digest.narrative)}</p>"
+        f"<p class='muted'>{h(digest.period_label)} • {h(digest.comparison_label)}</p>"
+        "</section>"
+    )
+
+
+def render_repo_health_detail_html(health: RepoHealth, now: datetime) -> str:
+    notes = "".join(f"<li>{h(note)}</li>" for note in health.notes)
+    commands = h(health.next_steps[0]) if health.next_steps else ""
+    return (
+        "<section class='card'>"
+        f"<h2>Repo Health Drilldown: {h(health.repository)}</h2>"
+        f"<p>Workflow runs: {h(repo_health_workflow_summary(health))}</p>"
+        f"<p>Oldest open PR: {h(repo_health_detail_label(health.oldest_open_pr, now, empty='No open PRs.'))}</p>"
+        f"<p>Oldest open issue: {h(repo_health_detail_label(health.oldest_open_issue, now, empty='No open issues.'))}</p>"
+        f"<p>Latest release: {h(repo_health_release_label(health, now))}</p>"
+        f"<p>Next step: {h(repo_health_warning(health, now))}</p>"
+        f"{f'<p><span class=\"cmd\">{commands}</span></p>' if commands else ''}"
+        f"{f'<ul>{notes}</ul>' if notes else ''}"
+        "</section>"
+    )
 
 
 def change_class(change: str) -> str:
